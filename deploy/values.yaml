@@ -1,0 +1,236 @@
+# -- Number of replicas
+replicaCount: 2
+
+image:
+  # -- Image repository
+  repository: harbor-router
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (default is the chart appVersion)
+  tag: ""
+
+# -- Image pull secrets
+imagePullSecrets: []
+# -- Override the chart name
+nameOverride: ""
+# -- Override the full release name
+fullnameOverride: ""
+
+# -- Harbor connection and router configuration
+config:
+  # -- Base URL of the Harbor instance
+  harborUrl: "http://harbor-core:80"
+  # -- Proxy-cache project name prefix to route under
+  proxyProject: "proxy"
+  # -- How often to re-discover proxy-cache projects (Go duration)
+  discoveryInterval: "60s"
+  # -- Per-project timeout during parallel fan-out (Go duration)
+  resolverTimeout: "10s"
+  # -- How long to cache image-to-project mappings (Go duration)
+  cacheTtl: "300s"
+  # -- Log level: debug, info, warn, error
+  logLevel: "info"
+  # -- Log format: pretty (human-readable) or json (structured)
+  logFormat: "json"
+  # -- Max idle HTTP connections per upstream host
+  maxIdleConnsPerHost: "512"
+  # -- How long idle connections are kept alive (Go duration)
+  idleConnTimeout: "90s"
+  # -- Max projects to fan out to (DoS protection)
+  maxFanoutProjects: "50"
+  # -- Use HTTP/2 without ALPN (set true if Harbor speaks HTTP/2 directly)
+  http2PriorKnowledge: "false"
+  # -- Max requests per IP per second (0 = unlimited)
+  rateLimitPerIp: "0"
+  # -- TCP listen backlog for connection bursts
+  listenBacklog: "8192"
+
+# -- Harbor credentials
+harbor:
+  auth:
+    # -- Use an existing secret for Harbor credentials.
+    # The secret must contain `username` and `password` keys.
+    existingSecret: ""
+    # -- Harbor robot account username (ignored if existingSecret is set)
+    username: ""
+    # -- Harbor robot account password (ignored if existingSecret is set)
+    password: ""
+
+  # -- Vault Agent Injector integration
+  vault:
+    # -- Enable Vault Agent Injector for secrets
+    enabled: false
+    # -- Vault role for Kubernetes auth
+    role: "harbor-router"
+    # -- Vault secret path
+    secretPath: "secret/data/harbor-router"
+    # -- Re-fetch secrets periodically (for rotation)
+    agentPrePopulateOnly: "false"
+
+serviceAccount:
+  # -- Create a ServiceAccount
+  create: true
+  # -- Annotations to add to the ServiceAccount
+  annotations: {}
+  # -- The name of the ServiceAccount (generated if not set)
+  name: ""
+  # -- Automount API credentials
+  automountServiceAccountToken: true
+
+# -- Annotations to add to the pod
+podAnnotations: {}
+
+# -- Labels to add to the pod
+podLabels: {}
+
+# -- Pod security context
+podSecurityContext: {}
+
+# -- Container security context
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  # -- Service type
+  type: ClusterIP
+  # -- Service port for HTTP traffic
+  port: 80
+
+# -- Container ports (do not change unless you also change LISTEN_ADDR / METRICS_ADDR)
+ports:
+  http: 8080
+  metrics: 9090
+
+# -- Resource requests and limits
+resources:
+  requests:
+    cpu: 200m
+    memory: 128Mi
+  limits:
+    cpu: "2"
+    memory: 512Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 2
+
+# -- Horizontal Pod Autoscaler
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  # targetMemoryUtilizationPercentage: 80
+
+# -- Pod Disruption Budget
+podDisruptionBudget:
+  enabled: false
+  # -- Minimum available pods (number or percentage)
+  minAvailable: 1
+  # maxUnavailable: 1
+
+# -- Deployment strategy
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+    maxSurge: 1
+
+# -- Node selector
+nodeSelector: {}
+
+# -- Tolerations
+tolerations: []
+
+# -- Affinity rules
+affinity: {}
+
+# -- Topology spread constraints
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+
+# -- Extra environment variables to add to the container
+extraEnv: []
+# - name: MY_VAR
+#   value: "my-value"
+
+# -- Extra volumes to add to the pod
+extraVolumes: []
+
+# -- Extra volume mounts to add to the container
+extraVolumeMounts: []
+
+# -- Ingress configuration (networking.k8s.io/v1)
+ingress:
+  enabled: false
+  # -- Ingress class name
+  className: "nginx"
+  # -- Annotations for the Ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+  hosts:
+    - host: registry.example.com
+      paths:
+        - path: /v2/proxy/
+          pathType: Prefix
+  tls: []
+  #  - secretName: registry-tls
+  #    hosts:
+  #      - registry.example.com
+
+# -- Gateway API HTTPRoute configuration
+httpRoute:
+  enabled: false
+  # -- Parent gateway reference (namespace/name)
+  parentRefs: []
+  #  - name: my-gateway
+  #    namespace: gateway-system
+  # -- Hostnames to match
+  hostnames: []
+  #  - registry.example.com
+  # -- Additional labels for the HTTPRoute
+  labels: {}
+  # -- Additional annotations for the HTTPRoute
+  annotations: {}
+
+# -- Prometheus Operator ServiceMonitor
+serviceMonitor:
+  enabled: false
+  # -- Namespace for the ServiceMonitor (defaults to release namespace)
+  namespace: ""
+  # -- Additional labels for the ServiceMonitor (e.g. release: prometheus)
+  labels: {}
+  # -- Scrape interval
+  interval: "30s"
+  # -- Scrape timeout
+  scrapeTimeout: "10s"
+  # -- Metric relabelings
+  metricRelabelings: []
+  # -- Relabelings
+  relabelings: []
