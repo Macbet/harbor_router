@@ -2,7 +2,7 @@ use crate::{cache, discovery, discovery::Discoverer, metrics};
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use http::HeaderMap;
 use std::{
     sync::Arc,
@@ -77,8 +77,9 @@ impl Resolver {
             .tcp_keepalive(Duration::from_secs(30))
             .tcp_nodelay(true) // Disable Nagle's algorithm
             .connect_timeout(Duration::from_secs(5))
-            // No global timeout - controlled per-request
-            .timeout(Duration::from_secs(0))
+            // Global timeout covers all paths including cache-hit fetches.
+            // parallel_lookup also applies its own per-request timeout via tokio::time::timeout.
+            .timeout(timeout)
             // Don't follow redirects (Harbor may redirect to storage)
             .redirect(reqwest::redirect::Policy::none());
 
@@ -341,10 +342,13 @@ impl Resolver {
             })
             .collect();
 
-        let results = join_all(futures).await;
-
+        // Use FuturesUnordered via buffer_unordered to return as soon as the
+        // first 200 response arrives, cancelling remaining futures.
+        let count = futures.len();
+        let mut results = stream::iter(futures).buffer_unordered(count);
         let mut last_err: Option<anyhow::Error> = None;
-        for res in results {
+
+        while let Some(res) = results.next().await {
             match res {
                 Ok(r) if r.status == 200 => {
                     info!(
@@ -420,7 +424,7 @@ impl Resolver {
         let status = resp.status().as_u16();
         metrics::global()
             .upstream_requests_total
-            .with_label_values(&[project, &status.to_string()])
+            .with_label_values(&[project, status_class(status)])
             .inc();
 
         let headers = resp.headers().clone();
@@ -435,6 +439,18 @@ impl Resolver {
             headers,
             body,
         })
+    }
+}
+
+/// Buckets an HTTP status code into a class label for Prometheus metrics.
+/// Prevents unbounded cardinality from arbitrary upstream status codes.
+#[inline]
+fn status_class(code: u16) -> &'static str {
+    match code {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
     }
 }
 

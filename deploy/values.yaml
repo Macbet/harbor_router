@@ -99,8 +99,8 @@ serviceAccount:
   annotations: {}
   # -- The name of the ServiceAccount (generated if not set)
   name: ""
-  # -- Automount API credentials
-  automountServiceAccountToken: true
+  # -- Automount API credentials (disabled — app does not use K8s API)
+  automountServiceAccountToken: false
 
 # -- Annotations to add to the pod
 podAnnotations: {}
@@ -109,7 +109,9 @@ podAnnotations: {}
 podLabels: {}
 
 # -- Pod security context
-podSecurityContext: {}
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
 
 # -- Container security context
 securityContext:

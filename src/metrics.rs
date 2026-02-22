@@ -44,8 +44,8 @@ pub struct Metrics {
     /// Key: "image"
     image_blob_requests: Arc<DashMap<String, u64>>,
 
-    /// Per-image manifest request counter (Prometheus).
-    /// Labels: image, tag, project
+    /// Total image requests by type (manifest/blob). No image label to prevent
+    /// cardinality explosion — per-image tracking uses the DashMap top-N approach.
     pub image_requests_total: CounterVec,
 }
 
@@ -114,8 +114,8 @@ pub fn global() -> &'static Metrics {
 
         image_requests_total: register_counter_vec!(
             "harbor_router_image_requests_total",
-            "Total requests per image (manifest + blob combined).",
-            &["image", "type"]
+            "Total image requests by type (manifest/blob).",
+            &["type"]
         )
         .expect("register image_requests_total"),
     })
@@ -134,9 +134,8 @@ impl Metrics {
             .and_modify(|count| *count += 1)
             .or_insert(1);
 
-        // Update Prometheus counter (uses image only for cardinality control)
         self.image_requests_total
-            .with_label_values(&[image, "manifest"])
+            .with_label_values(&["manifest"])
             .inc();
 
         // Evict if too many entries (simple LRU approximation)
@@ -152,10 +151,7 @@ impl Metrics {
             .and_modify(|count| *count += 1)
             .or_insert(1);
 
-        // Update Prometheus counter
-        self.image_requests_total
-            .with_label_values(&[image, "blob"])
-            .inc();
+        self.image_requests_total.with_label_values(&["blob"]).inc();
 
         // Evict if too many entries
         self.maybe_evict_blob_entries();
@@ -329,12 +325,8 @@ mod tests {
             .unwrap(),
             image_manifest_requests: Arc::new(DashMap::new()),
             image_blob_requests: Arc::new(DashMap::new()),
-            image_requests_total: register_counter_vec!(
-                "test_image_requests",
-                "test",
-                &["image", "type"]
-            )
-            .unwrap(),
+            image_requests_total: register_counter_vec!("test_image_requests", "test", &["type"])
+                .unwrap(),
         };
 
         // Record some requests

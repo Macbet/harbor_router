@@ -228,22 +228,31 @@ fn env_duration(key: &str, default: Duration) -> Duration {
         Ok(v) if !v.is_empty() => v,
         _ => return default,
     };
-    // Accept Go-style durations: e.g. "60s", "5m", "1h".
-    parse_go_duration(&v).unwrap_or(default)
+    // Accept Go-style durations: e.g. "60s", "5m", "1h", "300ms".
+    parse_go_duration(&v).unwrap_or_else(|| {
+        tracing::warn!(key, value = v, "invalid duration format, using default");
+        default
+    })
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => v.parse().unwrap_or_else(|_| {
+            tracing::warn!(key, value = v, "invalid integer, using default");
+            default
+        }),
+        _ => default,
+    }
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => v.parse().unwrap_or_else(|_| {
+            tracing::warn!(key, value = v, "invalid integer, using default");
+            default
+        }),
+        _ => default,
+    }
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -256,26 +265,43 @@ fn env_bool(key: &str, default: bool) -> bool {
 
 /// Parses a subset of Go duration strings: "300ms", "10s", "5m", "1h", "2h30m".
 fn parse_go_duration(s: &str) -> Option<Duration> {
-    let mut total_ms: u64 = 0;
-    let mut buf = String::new();
+    if s.is_empty() {
+        return None;
+    }
 
-    for ch in s.chars() {
-        if ch.is_ascii_digit() || ch == '.' {
-            buf.push(ch);
+    let mut total_ms: u64 = 0;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Accumulate digits (including '.')
+        let start = i;
+        while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            i += 1;
+        }
+        if i == start {
+            return None; // no number before unit
+        }
+        let n: f64 = chars[start..i].iter().collect::<String>().parse().ok()?;
+
+        // Parse unit (handle "ms" as a two-character unit)
+        if i >= chars.len() {
+            return None; // trailing number without unit
+        }
+        let ms = if i + 1 < chars.len() && chars[i] == 'm' && chars[i + 1] == 's' {
+            i += 2;
+            n as u64
         } else {
-            let n: f64 = buf.parse().ok()?;
-            buf.clear();
-            let ms = match ch {
+            let unit = chars[i];
+            i += 1;
+            match unit {
                 's' => (n * 1_000.0) as u64,
                 'm' => (n * 60_000.0) as u64,
                 'h' => (n * 3_600_000.0) as u64,
                 _ => return None,
-            };
-            total_ms += ms;
-        }
-    }
-    if !buf.is_empty() {
-        return None; // trailing number without unit
+            }
+        };
+        total_ms += ms;
     }
     Some(Duration::from_millis(total_ms))
 }
@@ -324,7 +350,18 @@ mod tests {
     fn test_parse_go_duration_invalid() {
         assert_eq!(parse_go_duration("10"), None); // no unit
         assert_eq!(parse_go_duration("10x"), None); // invalid unit
-        assert_eq!(parse_go_duration(""), Some(Duration::from_millis(0))); // empty is valid (0)
+        assert_eq!(parse_go_duration(""), None); // empty is invalid
+    }
+
+    #[test]
+    fn test_parse_go_duration_milliseconds() {
+        assert_eq!(parse_go_duration("300ms"), Some(Duration::from_millis(300)));
+        assert_eq!(parse_go_duration("1ms"), Some(Duration::from_millis(1)));
+        assert_eq!(parse_go_duration("0ms"), Some(Duration::from_millis(0)));
+        assert_eq!(
+            parse_go_duration("1s500ms"),
+            Some(Duration::from_millis(1500))
+        );
     }
 
     #[test]

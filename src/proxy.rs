@@ -16,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -113,8 +113,6 @@ pub async fn registry_handler(
         .iter()
         .filter_map(|v| v.to_str().ok().map(str::to_string))
         .collect();
-    let method = req.method().clone();
-
     match parse_path(remainder) {
         Err(e) => {
             warn!(path, error = %e, "bad request path");
@@ -131,7 +129,7 @@ pub async fn registry_handler(
             .await
         }
         Ok((image, PathKind::Blobs, digest)) => {
-            handle_blob(&state, image, digest, auth_header, method).await
+            handle_blob(&state, image, digest, auth_header).await
         }
     }
 }
@@ -197,7 +195,6 @@ async fn handle_blob(
     image: &str,
     digest: &str,
     auth: Option<String>,
-    method: http::Method,
 ) -> Response {
     let start = Instant::now();
 
@@ -242,7 +239,12 @@ async fn handle_blob(
         }
     };
 
-    proxy_blob(state, &project, image, digest, auth.as_deref(), method).await
+    let response = proxy_blob(state, &project, image, digest, auth.as_deref()).await;
+    metrics::global()
+        .blob_proxy_duration
+        .with_label_values(&["ok"])
+        .observe(start.elapsed().as_secs_f64());
+    response
 }
 
 /// Streams a blob from Harbor to the client via a direct reqwest request.
@@ -253,7 +255,6 @@ async fn proxy_blob(
     image: &str,
     digest: &str,
     auth: Option<&str>,
-    method: http::Method,
 ) -> Response {
     if !discovery::is_safe_project_name(project) {
         error!(
@@ -271,7 +272,7 @@ async fn proxy_blob(
         state.harbor_url, project, image, digest
     );
 
-    let mut req = state.blob_client.request(method, &target_url);
+    let mut req = state.blob_client.get(&target_url);
     if let Some(a) = auth {
         req = req.header("Authorization", a);
     }
@@ -342,9 +343,10 @@ async fn probe_blob_project(
         })
         .collect();
 
-    let results = join_all(futures).await;
+    let count = futures.len();
+    let mut results = stream::iter(futures).buffer_unordered(count);
 
-    for (proj, result) in results {
+    while let Some((proj, result)) = results.next().await {
         match result {
             Ok(Ok(resp)) => {
                 let s = resp.status().as_u16();
@@ -416,7 +418,7 @@ pub async fn logging_middleware(req: Request, next: Next) -> Response {
 
     metrics::global()
         .requests_total
-        .with_label_values(&[method.as_str(), req_type, &status.to_string()])
+        .with_label_values(&[method.as_str(), req_type, status_class])
         .inc();
 
     // Log level based on status and type
@@ -474,6 +476,33 @@ enum PathKind {
     Blobs,
 }
 
+/// Validates that an image name is safe for URL construction.
+/// OCI image names may contain `/` (e.g., `library/nginx`), so slashes are allowed,
+/// but path traversal sequences, backslashes, and control characters are rejected.
+#[inline]
+fn is_safe_image_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && !name.contains('\\')
+        && !name.contains(|c: char| c.is_control())
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && name == name.trim()
+}
+
+/// Validates that a reference (tag or digest) is safe for URL construction.
+/// References never contain path separators; they are either tags (`latest`, `v1.0`)
+/// or digests (`sha256:abcdef...`).
+#[inline]
+fn is_safe_reference(reference: &str) -> bool {
+    !reference.is_empty()
+        && !reference.contains('/')
+        && !reference.contains('\\')
+        && !reference.contains("..")
+        && !reference.contains(|c: char| c.is_control())
+        && reference == reference.trim()
+}
+
 /// Parses a remainder like `grafana/grafana/manifests/latest` into
 /// `(image, kind, reference)` without unnecessary allocations.
 #[inline]
@@ -485,6 +514,12 @@ fn parse_path(path: &str) -> anyhow::Result<(&str, PathKind, &str)> {
         if image.is_empty() || reference.is_empty() {
             anyhow::bail!("invalid path: missing image or reference");
         }
+        if !is_safe_image_name(image) {
+            anyhow::bail!("invalid image name: unsafe characters or path traversal");
+        }
+        if !is_safe_reference(reference) {
+            anyhow::bail!("invalid reference: unsafe characters or path traversal");
+        }
         return Ok((image, PathKind::Manifests, reference));
     }
 
@@ -493,6 +528,12 @@ fn parse_path(path: &str) -> anyhow::Result<(&str, PathKind, &str)> {
         let reference = &path[idx + 7..]; // "/blobs/".len() == 7
         if image.is_empty() || reference.is_empty() {
             anyhow::bail!("invalid path: missing image or reference");
+        }
+        if !is_safe_image_name(image) {
+            anyhow::bail!("invalid image name: unsafe characters or path traversal");
+        }
+        if !is_safe_reference(reference) {
+            anyhow::bail!("invalid reference: unsafe characters or path traversal");
         }
         return Ok((image, PathKind::Blobs, reference));
     }
@@ -528,13 +569,13 @@ fn build_response(
     resp
 }
 
-/// Pre-allocated error response JSON template
+/// Error response following the OCI distribution error format.
 #[inline]
 fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = format!(
-        r#"{{"errors":[{{"code":"{}","message":"{}"}}]}}"#,
-        code, message
-    );
+    let body = serde_json::json!({
+        "errors": [{"code": code, "message": message}]
+    })
+    .to_string();
     let mut resp = Response::new(Body::from(body));
     *resp.status_mut() = status;
     resp.headers_mut()
@@ -657,5 +698,123 @@ mod tests {
         assert_eq!(image, "my-manifests-project");
         assert_eq!(kind, PathKind::Manifests);
         assert_eq!(reference, "v1.0.0");
+    }
+
+    // ─── path traversal / input validation tests ────────────────────────
+
+    #[test]
+    fn test_parse_path_rejects_traversal_in_image() {
+        let result = parse_path("../admin/nginx/manifests/latest");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_rejects_deep_traversal_in_image() {
+        let result = parse_path("../../secret-project/nginx/manifests/latest");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_rejects_mid_traversal_in_image() {
+        let result = parse_path("nginx/../admin/manifests/latest");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_rejects_traversal_in_reference() {
+        let result = parse_path("nginx/manifests/../../foo");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_rejects_backslash_in_image() {
+        let result = parse_path("nginx\\admin/manifests/latest");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_rejects_control_chars_in_image() {
+        let result = parse_path("nginx\x00evil/manifests/latest");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_rejects_slash_in_reference() {
+        let result = parse_path("nginx/manifests/latest/../../evil");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_rejects_leading_slash_in_image() {
+        let result = parse_path("/nginx/manifests/latest");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_rejects_traversal_in_blob_image() {
+        let result = parse_path("../admin/nginx/blobs/sha256:abc123");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_rejects_slash_in_blob_digest() {
+        let result = parse_path("nginx/blobs/sha256:abc/../../evil");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_accepts_valid_digest() {
+        let (image, kind, reference) = parse_path(
+            "nginx/blobs/sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+        assert_eq!(image, "nginx");
+        assert_eq!(kind, PathKind::Blobs);
+        assert_eq!(
+            reference,
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn test_is_safe_image_name() {
+        assert!(is_safe_image_name("nginx"));
+        assert!(is_safe_image_name("library/nginx"));
+        assert!(is_safe_image_name("grafana/grafana"));
+        assert!(is_safe_image_name("a/b/c"));
+        assert!(!is_safe_image_name(""));
+        assert!(!is_safe_image_name(".."));
+        assert!(!is_safe_image_name("../admin"));
+        assert!(!is_safe_image_name("foo/../bar"));
+        assert!(!is_safe_image_name("foo\\bar"));
+        assert!(!is_safe_image_name("foo\x00bar"));
+        assert!(!is_safe_image_name("/leading"));
+        assert!(!is_safe_image_name("trailing/"));
+        assert!(!is_safe_image_name(" spaces "));
+    }
+
+    #[test]
+    fn test_is_safe_reference() {
+        assert!(is_safe_reference("latest"));
+        assert!(is_safe_reference("v1.0.0"));
+        assert!(is_safe_reference("sha256:abc123"));
+        assert!(is_safe_reference("my-tag_v2.1"));
+        assert!(!is_safe_reference(""));
+        assert!(!is_safe_reference(".."));
+        assert!(!is_safe_reference("../../foo"));
+        assert!(!is_safe_reference("foo/bar"));
+        assert!(!is_safe_reference("foo\\bar"));
+        assert!(!is_safe_reference("foo\x00bar"));
+        assert!(!is_safe_reference(" spaces "));
     }
 }
