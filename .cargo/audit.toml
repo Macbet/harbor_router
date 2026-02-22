@@ -1,0 +1,9 @@
+[advisories]
+# RUSTSEC-2024-0437 / CVE-2025-53605
+# protobuf 2.28.0 — stack overflow when parsing malformed protobuf input.
+# harbor-router uses protobuf as a transitive dependency through the
+# `prometheus` crate (metrics exposition only). We never parse protobuf
+# from untrusted user input, so this vulnerability is not exploitable here.
+# Patched in protobuf >= 3.7.2 (a different semver-incompatible major
+# version); an upgrade requires prometheus itself to migrate to protobuf 3.x.
+ignore = ["RUSTSEC-2024-0437"]
