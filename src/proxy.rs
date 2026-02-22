@@ -1,4 +1,4 @@
-use crate::{metrics, resolver::Resolver};
+use crate::{discovery, metrics, resolver::Resolver};
 
 /// RAII guard that decrements the in-flight counter when dropped.
 struct InflightGuard;
@@ -255,6 +255,18 @@ async fn proxy_blob(
     auth: Option<&str>,
     method: http::Method,
 ) -> Response {
+    if !discovery::is_safe_project_name(project) {
+        error!(
+            event = "blob_proxy",
+            project,
+            "refusing unsafe project name in URL construction"
+        );
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_UNKNOWN",
+            "internal routing error",
+        );
+    }
     let target_url = format!(
         "{}/v2/{}/{}/blobs/{}",
         state.harbor_url, project, image, digest

@@ -1,4 +1,4 @@
-use crate::{cache, discovery::Discoverer, metrics};
+use crate::{cache, discovery, discovery::Discoverer, metrics};
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -389,6 +389,9 @@ impl Resolver {
         auth: Option<&str>,
         accept: &[String],
     ) -> Result<ResolveResult> {
+        if !discovery::is_safe_project_name(project) {
+            bail!("refusing unsafe project name in URL construction: {}", project);
+        }
         let url = format!(
             "{}/v2/{}/{}/manifests/{}",
             self.harbor_url, project, image, reference

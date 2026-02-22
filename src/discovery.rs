@@ -22,7 +22,7 @@ struct HarborProject {
 /// and names with control characters. This prevents cache poisoning attacks
 /// where a compromised Redis could inject malicious project names to access
 /// unintended Harbor API endpoints.
-fn is_safe_project_name(name: &str) -> bool {
+pub(crate) fn is_safe_project_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains('/')
         && !name.contains('\\')
@@ -268,5 +268,54 @@ impl Discoverer {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_project_names() {
+        assert!(is_safe_project_name("dockerhub"));
+        assert!(is_safe_project_name("my-project"));
+        assert!(is_safe_project_name("project_123"));
+        assert!(is_safe_project_name("a"));
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(!is_safe_project_name(""));
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(!is_safe_project_name(".."));
+        assert!(!is_safe_project_name("../admin"));
+        assert!(!is_safe_project_name("../../admin"));
+        assert!(!is_safe_project_name("foo..bar"));
+    }
+
+    #[test]
+    fn rejects_slashes() {
+        assert!(!is_safe_project_name("foo/bar"));
+        assert!(!is_safe_project_name("/leading"));
+        assert!(!is_safe_project_name("trailing/"));
+        assert!(!is_safe_project_name("foo\\bar"));
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        assert!(!is_safe_project_name("has\x00null"));
+        assert!(!is_safe_project_name("has\nnewline"));
+        assert!(!is_safe_project_name("has\ttab"));
+        assert!(!is_safe_project_name("has\rreturn"));
+    }
+
+    #[test]
+    fn rejects_whitespace_padding() {
+        assert!(!is_safe_project_name(" leading"));
+        assert!(!is_safe_project_name("trailing "));
+        assert!(!is_safe_project_name(" both "));
     }
 }
