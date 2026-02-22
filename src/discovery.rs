@@ -16,6 +16,21 @@ struct HarborProject {
     registry_id: Option<serde_json::Value>,
 }
 
+/// Validates that a project name is safe for use in URL path construction.
+///
+/// Rejects names containing path traversal sequences (`..`, `/`), empty names,
+/// and names with control characters. This prevents cache poisoning attacks
+/// where a compromised Redis could inject malicious project names to access
+/// unintended Harbor API endpoints.
+fn is_safe_project_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.contains(|c: char| c.is_control())
+        && name == name.trim()
+}
+
 /// Discoverer periodically queries the Harbor API to find all proxy-cache projects
 /// (projects where `registry_id` is not null).
 ///
@@ -98,8 +113,24 @@ impl Discoverer {
         match cache.get(DISCOVERY_CACHE_KEY).await {
             Some(json) => match serde_json::from_str::<Vec<String>>(&json) {
                 Ok(projects) if !projects.is_empty() => {
-                    let count = projects.len();
-                    self.inner.projects.store(Arc::new(projects));
+                    let (safe, rejected): (Vec<_>, Vec<_>) =
+                        projects.into_iter().partition(|n| is_safe_project_name(n));
+                    if !rejected.is_empty() {
+                        error!(
+                            event = "discovery",
+                            rejected_count = rejected.len(),
+                            "rejected unsafe project names from cache (possible cache poisoning)"
+                        );
+                    }
+                    if safe.is_empty() {
+                        debug!(
+                            event = "discovery",
+                            "all cached project names were rejected, will fetch from API"
+                        );
+                        return;
+                    }
+                    let count = safe.len();
+                    self.inner.projects.store(Arc::new(safe));
                     metrics::global().discovered_projects.set(count as f64);
                     info!(
                         event = "discovery",
@@ -218,7 +249,15 @@ impl Discoverer {
             let fetched = projects.len();
             for p in projects {
                 if p.registry_id.is_some() {
-                    result.push(p.name);
+                    if is_safe_project_name(&p.name) {
+                        result.push(p.name);
+                    } else {
+                        error!(
+                            event = "discovery",
+                            project = p.name,
+                            "skipped project with unsafe name from Harbor API"
+                        );
+                    }
                 }
             }
 

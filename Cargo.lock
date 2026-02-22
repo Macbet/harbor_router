@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "harbor-router"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
