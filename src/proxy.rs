@@ -326,6 +326,7 @@ async fn probe_blob_project(
 
     let futures: Vec<_> = projects
         .iter()
+        .filter(|proj| discovery::is_safe_project_name(proj))
         .map(|proj| {
             let proj = proj.clone();
             let url = format!("{}/v2/{}/{}/blobs/{}", harbor_url, proj, image, digest);
