@@ -1,0 +1,77 @@
+name: Helm
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths:
+      - "deploy/**"
+      - ".github/workflows/helm.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "deploy/**"
+      - ".github/workflows/helm.yaml"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: helm lint deploy/
+
+  package-push:
+    name: Package & Push
+    runs-on: ubuntu-latest
+    needs: lint
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Determine chart version
+        id: version
+        run: |
+          BASE=$(grep '^version:' deploy/Chart.yaml | awk '{print $2}')
+          SHA=$(git rev-parse --short HEAD)
+          # Sanitize branch name: replace / and _ with -
+          BRANCH=$(echo "${GITHUB_REF_NAME}" | sed 's/[/_]/-/g')
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "version=${BASE}-${BRANCH}-${SHA}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Package chart
+        run: |
+          helm package deploy/ \
+            --version "${{ steps.version.outputs.version }}" \
+            --app-version "${{ steps.version.outputs.version }}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push chart to GHCR
+        run: |
+          helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password "${{ secrets.GITHUB_TOKEN }}"
+          helm push "harbor-router-${{ steps.version.outputs.version }}.tgz" \
+            oci://ghcr.io/${{ github.repository_owner }}/charts
