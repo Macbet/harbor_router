@@ -1,0 +1,164 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "harbor-router.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "harbor-router.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "harbor-router.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.ports.metrics | quote }}
+        prometheus.io/path: "/metrics"
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.harbor.vault.enabled }}
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: {{ .Values.harbor.vault.role | quote }}
+        vault.hashicorp.com/agent-inject-secret-username: {{ .Values.harbor.vault.secretPath | quote }}
+        vault.hashicorp.com/agent-inject-template-username: |
+          {{`{{- with secret "`}}{{ .Values.harbor.vault.secretPath }}{{`" -}}{{ .Data.data.username }}{{- end -}}`}}
+        vault.hashicorp.com/agent-inject-secret-password: {{ .Values.harbor.vault.secretPath | quote }}
+        vault.hashicorp.com/agent-inject-template-password: |
+          {{`{{- with secret "`}}{{ .Values.harbor.vault.secretPath }}{{`" -}}{{ .Data.data.password }}{{- end -}}`}}
+        vault.hashicorp.com/agent-pre-populate-only: {{ .Values.harbor.vault.agentPrePopulateOnly | quote }}
+        {{- end }}
+      labels:
+        {{- include "harbor-router.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "harbor-router.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ include "harbor-router.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.ports.metrics }}
+              protocol: TCP
+          env:
+            - name: HARBOR_URL
+              value: {{ .Values.config.harborUrl | quote }}
+            - name: PROXY_PROJECT
+              value: {{ .Values.config.proxyProject | quote }}
+            - name: DISCOVERY_INTERVAL
+              value: {{ .Values.config.discoveryInterval | quote }}
+            - name: RESOLVER_TIMEOUT
+              value: {{ .Values.config.resolverTimeout | quote }}
+            - name: CACHE_TTL
+              value: {{ .Values.config.cacheTtl | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            - name: LOG_FORMAT
+              value: {{ .Values.config.logFormat | quote }}
+            - name: MAX_IDLE_CONNS_PER_HOST
+              value: {{ .Values.config.maxIdleConnsPerHost | quote }}
+            - name: IDLE_CONN_TIMEOUT
+              value: {{ .Values.config.idleConnTimeout | quote }}
+            - name: MAX_FANOUT_PROJECTS
+              value: {{ .Values.config.maxFanoutProjects | quote }}
+            - name: HTTP2_PRIOR_KNOWLEDGE
+              value: {{ .Values.config.http2PriorKnowledge | quote }}
+            - name: RATE_LIMIT_PER_IP
+              value: {{ .Values.config.rateLimitPerIp | quote }}
+            - name: LISTEN_BACKLOG
+              value: {{ .Values.config.listenBacklog | quote }}
+            - name: LISTEN_ADDR
+              value: ":{{ .Values.ports.http }}"
+            - name: METRICS_ADDR
+              value: ":{{ .Values.ports.metrics }}"
+            {{- if .Values.harbor.vault.enabled }}
+            # Vault Agent Injector: read credentials from files
+            - name: HARBOR_USERNAME_FILE
+              value: "/vault/secrets/username"
+            - name: HARBOR_PASSWORD_FILE
+              value: "/vault/secrets/password"
+            {{- else }}
+            # Credentials from Kubernetes Secret
+            - name: HARBOR_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "harbor-router.secretName" . }}
+                  key: username
+            - name: HARBOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "harbor-router.secretName" . }}
+                  key: password
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "harbor-router.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}

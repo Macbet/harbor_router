@@ -1,0 +1,53 @@
+[package]
+name = "harbor-router"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "harbor-router"
+path = "src/main.rs"
+
+[dependencies]
+anyhow       = "1.0"
+arc-swap     = "1.7"
+governor     = { version = "0.10", features = ["dashmap"] }  # Rate limiting
+axum         = { version = "0.8", features = ["http1", "http2", "macros"] }
+bytes        = "1.10"
+dashmap      = "6.1"                    # Lock-free concurrent HashMap for singleflight
+futures      = "0.3"
+http         = "1.3"
+http-body-util = "0.1"
+hyper        = { version = "1.6", features = ["full"] }
+hyper-util   = { version = "0.1", features = ["full", "tokio"] }
+moka         = { version = "0.12", default-features = false, features = ["sync"] }
+num_cpus     = "1.16"                   # For runtime tuning
+prometheus   = { version = "0.13", features = ["process"] }
+reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
+secrecy      = { version = "0.10", features = ["serde"] }  # Credential protection
+serde        = { version = "1.0", features = ["derive"] }
+serde_json   = "1.0"
+socket2      = { version = "0.5", features = ["all"] }  # TCP tuning (SO_REUSEPORT, etc.)
+time         = { version = "0.3", features = ["formatting", "macros"] }  # Custom log timestamp format
+tokio        = { version = "1", features = ["full", "parking_lot"] }
+tokio-util   = { version = "0.7", features = ["io"] }
+scopeguard   = "1.2"
+tower        = { version = "0.5", features = ["util", "limit", "load-shed"] }
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot", "time", "local-time"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+
+# ── Release optimizations for 500k RPS ────────────────────────────────────────
+[profile.release]
+lto = "thin"              # Link-time optimization (thin for faster builds)
+codegen-units = 1         # Single codegen unit for better optimization
+opt-level = 3             # Maximum optimization
+panic = "abort"           # Smaller binary, no unwinding overhead
+strip = true              # Strip symbols
+
+# Even more aggressive profile for production
+[profile.release-prod]
+inherits = "release"
+lto = "fat"               # Full LTO for maximum performance
+debug = false
