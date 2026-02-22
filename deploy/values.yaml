@@ -46,6 +46,8 @@ config:
   listenBacklog: "8192"
 
 # -- Redis Sentinel cache (optional — leave sentinels empty for in-memory Moka cache)
+# NOTE: This chart does NOT install Redis. You must deploy Redis Sentinel separately
+# (e.g. via the Bitnami redis chart) and provide the sentinel endpoints below.
 redis:
   # -- Comma-separated Redis Sentinel endpoints (e.g. "sentinel1:26379,sentinel2:26379")
   sentinels: ""

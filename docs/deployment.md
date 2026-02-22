@@ -97,6 +97,8 @@ Vault injects credentials as files at `/vault/secrets/username` and `/vault/secr
 
 By default, each pod uses an in-memory cache. To share the cache across pods (recommended for multi-replica deployments), configure Redis Sentinel.
 
+> **Note:** This chart does not install Redis. You must deploy Redis Sentinel separately (e.g. via the [Bitnami Redis chart](https://github.com/bitnami/charts/tree/main/bitnami/redis)) and provide the sentinel endpoints below.
+
 ### Helm values
 
 ```yaml
