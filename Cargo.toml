@@ -1,6 +1,6 @@
 [package]
 name = "harbor-router"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 
 [[bin]]
@@ -17,9 +17,6 @@ bytes        = "1.11"
 dashmap      = "6.1"                    # Lock-free concurrent HashMap for singleflight
 futures      = "0.3"
 http         = "1.4"
-http-body-util = "0.1"
-hyper        = { version = "1.8", features = ["full"] }
-hyper-util   = { version = "0.1", features = ["full", "tokio"] }
 moka         = { version = "0.12", default-features = false, features = ["sync"] }
 num_cpus     = "1.17"                   # For runtime tuning
 prometheus   = { version = "0.14", features = ["process"] }
@@ -31,9 +28,6 @@ serde_json   = "1.0"
 socket2      = { version = "0.5", features = ["all"] }  # TCP tuning (SO_REUSEPORT, etc.)
 time         = { version = "0.3", features = ["formatting", "macros"] }  # Custom log timestamp format
 tokio        = { version = "1", features = ["full", "parking_lot"] }
-tokio-util   = { version = "0.7", features = ["io"] }
-scopeguard   = "1.2"
-tower        = { version = "0.5", features = ["util", "limit", "load-shed"] }
 tracing      = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot", "time", "local-time"] }
 

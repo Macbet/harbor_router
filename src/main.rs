@@ -7,11 +7,7 @@ mod resolver;
 
 use anyhow::Result;
 use axum::{
-    extract::ConnectInfo,
-    http::StatusCode,
-    middleware,
-    response::IntoResponse,
-    routing::{any, get},
+    extract::ConnectInfo, http::StatusCode, middleware, response::IntoResponse, routing::get,
     Router,
 };
 use governor::{Quota, RateLimiter};
@@ -195,8 +191,8 @@ async fn async_main() -> Result<()> {
 
     let app = Router::new()
         .route("/v2/", get(proxy::v2_check))
-        .route(&prefix, any(proxy::registry_handler))
-        .route(&prefix_wildcard, any(proxy::registry_handler))
+        .route(&prefix, get(proxy::registry_handler))
+        .route(&prefix_wildcard, get(proxy::registry_handler))
         .route(
             "/healthz",
             get(move || health_handler(disc_for_health.clone())),
@@ -282,7 +278,7 @@ fn create_optimized_listener(addr: SocketAddr, backlog: u32) -> Result<TcpListen
 
     // Bind and listen with large backlog for connection bursts
     socket.bind(&addr.into())?;
-    socket.listen(backlog as i32)?;
+    socket.listen(backlog.min(i32::MAX as u32) as i32)?;
 
     // Convert to non-blocking and wrap in tokio
     socket.set_nonblocking(true)?;
