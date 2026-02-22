@@ -53,7 +53,7 @@ pub struct Config {
     /// Sentinel master group name (default: "mymaster").
     pub redis_master_name: String,
     /// Optional Redis AUTH password.
-    pub redis_password: Option<String>,
+    pub redis_password: Option<SecretString>,
     /// Redis database number (default: 0).
     pub redis_db: u8,
     /// Key prefix for cache entries (default: "hr").
@@ -118,7 +118,10 @@ impl Clone for Config {
             rate_limit_per_ip: self.rate_limit_per_ip,
             redis_sentinels: self.redis_sentinels.clone(),
             redis_master_name: self.redis_master_name.clone(),
-            redis_password: self.redis_password.clone(),
+            redis_password: self
+                .redis_password
+                .as_ref()
+                .map(|s| SecretString::from(s.expose_secret().to_string())),
             redis_db: self.redis_db,
             redis_key_prefix: self.redis_key_prefix.clone(),
             log_level: self.log_level.clone(),
@@ -175,7 +178,7 @@ impl Config {
                 if v.is_empty() {
                     None
                 } else {
-                    Some(v)
+                    Some(SecretString::from(v))
                 }
             },
             redis_db: env_u32("REDIS_DB", 0) as u8,

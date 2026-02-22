@@ -123,7 +123,7 @@ async fn async_main() -> Result<()> {
         cache::RedisCache::from_sentinel(
             &cfg.redis_sentinels,
             &cfg.redis_master_name,
-            cfg.redis_password.as_deref(),
+            cfg.redis_password.as_ref().map(|s| s.expose_secret() as &str),
             cfg.redis_db,
             cfg.cache_ttl,
             cfg.redis_key_prefix.clone(),
