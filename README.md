@@ -17,9 +17,19 @@ Harbor supports multiple proxy-cache projects, each mirroring a different upstre
 client → harbor-router → Harbor project: dockerhub
                        → Harbor project: ghcr
                        → Harbor project: quay
+                       ↕ (optional)
+                   Redis Sentinel
 ```
 
 On a cache hit, the router fetches the manifest directly from the known project — no fan-out, no extra latency.
+
+### Shared cache (Redis Sentinel)
+
+By default, each pod uses an in-memory cache (Moka). When `REDIS_SENTINELS` is configured, all pods share the same cache via Redis Sentinel, giving you:
+
+- **Instant warm start** — new pods seed their project list and image mappings from Redis before querying Harbor
+- **Cross-pod cache sharing** — a cache hit on one pod benefits all pods immediately
+- **Graceful fallback** — if Redis is unreachable, each pod falls back to its local in-memory cache automatically
 
 ## Quick start
 
@@ -84,6 +94,12 @@ All configuration is via environment variables. Duration values accept Go-style 
 | `METRICS_ADDR` | `:9090` | Prometheus metrics listen address |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `LOG_FORMAT` | `pretty` | `pretty` (human-readable) or `json` (structured) |
+| `REDIS_SENTINELS` | — | Comma-separated Sentinel endpoints (e.g. `sentinel1:26379,sentinel2:26379`). Leave empty for in-memory cache |
+| `REDIS_MASTER_NAME` | `mymaster` | Sentinel master group name |
+| `REDIS_PASSWORD` | — | Redis AUTH password |
+| `REDIS_PASSWORD_FILE` | — | Path to file containing Redis password (Vault injector) |
+| `REDIS_DB` | `0` | Redis database number |
+| `REDIS_KEY_PREFIX` | `hr` | Key prefix for cache entries |
 
 ## Endpoints
 

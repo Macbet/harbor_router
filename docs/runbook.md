@@ -97,6 +97,37 @@ curl -s http://harbor-router:9090/metrics | grep cache_lookups_total
 
 ---
 
+### Redis cache not working
+
+**Symptom:** Pods are not sharing cache despite `REDIS_SENTINELS` being configured. New pods still start with cold caches.
+
+**Diagnosis:**
+
+```bash
+# Check logs for Redis fallback
+kubectl logs -l app.kubernetes.io/name=harbor-router | grep -i redis
+
+# Check if discovery seeded from cache
+kubectl logs -l app.kubernetes.io/name=harbor-router | jq 'select(.source=="cache")'
+
+# Test Redis connectivity from within the pod
+kubectl exec -it deploy/harbor-router -- sh -c \
+  'echo PING | nc sentinel1 26379'
+```
+
+**Common causes:**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No Redis logs at all | `REDIS_SENTINELS` not set | Set it in Helm values or env vars |
+| Fallback to Moka on every request | Sentinel unreachable | Check network policies, sentinel endpoints |
+| Auth errors in logs | Wrong password | Check `REDIS_PASSWORD` or Vault secret |
+| Connected but keys not shared | Different `REDIS_KEY_PREFIX` | Ensure all pods use the same prefix |
+
+> When Redis is unreachable, harbor-router silently falls back to the local in-memory cache. There is no error — the router continues serving requests normally. Check `debug`-level logs for fallback events.
+
+---
+
 ### Pod OOMKilled
 
 **Symptom:** Pod restarts with `OOMKilled`.
@@ -145,13 +176,15 @@ Common issues:
 
 ### Horizontal scaling
 
-harbor-router is stateless — all state is in the in-memory cache (per-pod). Scale replicas freely. The `topologySpreadConstraints` in the deployment ensures pods spread across nodes.
+harbor-router is stateless — scale replicas freely. The `topologySpreadConstraints` in the deployment ensures pods spread across nodes.
 
 ```bash
 kubectl scale deploy/harbor-router --replicas=4
 ```
 
-**Note:** Each pod has its own cache. After scaling up, new pods will have cold caches and will fan-out until they warm up. This is expected and harmless.
+**Without Redis:** Each pod has its own cache. After scaling up, new pods have cold caches and fan-out until they warm up. This is expected and harmless.
+
+**With Redis Sentinel:** New pods seed from the shared cache on startup — they get an instant warm start with the discovered project list and any previously resolved image mappings. Cache misses resolved by one pod are immediately available to all others.
 
 ### Vertical scaling (tuning for higher RPS)
 
