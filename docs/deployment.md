@@ -93,6 +93,51 @@ Vault injects credentials as files at `/vault/secrets/username` and `/vault/secr
 
 ---
 
+## Redis Sentinel (shared cache)
+
+By default, each pod uses an in-memory cache. To share the cache across pods (recommended for multi-replica deployments), configure Redis Sentinel.
+
+> **Note:** This chart does not install Redis. You must deploy Redis Sentinel separately (e.g. via the [Bitnami Redis chart](https://github.com/bitnami/charts/tree/main/bitnami/redis)) and provide the sentinel endpoints below.
+
+### Helm values
+
+```yaml
+redis:
+  sentinels: "sentinel1:26379,sentinel2:26379,sentinel3:26379"
+  masterName: "mymaster"
+  db: "0"
+  keyPrefix: "hr"
+  auth:
+    # Option 1: existing Kubernetes secret (must contain a `password` key)
+    existingSecret: "redis-auth"
+    # Option 2: raw password (not recommended for production)
+    password: ""
+  vault:
+    # Option 3: Vault Agent Injector
+    enabled: false
+    secretPath: "secret/data/redis"
+```
+
+### Benefits
+
+- **Instant warm start** — new pods seed their project list and image mappings from Redis before querying Harbor
+- **Cross-pod cache sharing** — a cache miss resolved by one pod is immediately available to all others
+- **Graceful degradation** — if Redis is unreachable, pods automatically fall back to local in-memory cache
+
+### Without Helm
+
+Set the following environment variables:
+
+```bash
+REDIS_SENTINELS=sentinel1:26379,sentinel2:26379
+REDIS_MASTER_NAME=mymaster
+REDIS_PASSWORD=secret           # or REDIS_PASSWORD_FILE=/vault/secrets/redis-password
+REDIS_DB=0
+REDIS_KEY_PREFIX=hr
+```
+
+---
+
 ## Ingress (HTTPRoute / Gateway API)
 
 harbor-router must be routed **before** the generic `/v2/` rule, since HTTPRoute rules are evaluated in order.
@@ -166,13 +211,15 @@ For Vault-managed credentials, the Vault agent re-fetches on its own TTL cycle. 
 
 ## Scaling
 
-harbor-router is stateless — all state is in the per-pod in-memory cache. Scale replicas freely.
+harbor-router is stateless — scale replicas freely.
 
 ```bash
 kubectl scale deploy/harbor-router --replicas=4
 ```
 
-New pods start with cold caches and fan-out until they warm up. This is expected and harmless — the upstream Harbor handles the load.
+**Without Redis:** each pod has its own in-memory cache. New pods start cold and fan-out until they warm up.
+
+**With Redis Sentinel:** new pods seed from the shared cache on startup (instant warm start). Cache hits on any pod benefit all pods immediately.
 
 ### Tuning for higher RPS
 

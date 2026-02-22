@@ -36,6 +36,12 @@ spec:
           {{`{{- with secret "`}}{{ .Values.harbor.vault.secretPath }}{{`" -}}{{ .Data.data.password }}{{- end -}}`}}
         vault.hashicorp.com/agent-pre-populate-only: {{ .Values.harbor.vault.agentPrePopulateOnly | quote }}
         {{- end }}
+        {{- if and .Values.redis.sentinels .Values.redis.vault.enabled }}
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-secret-redis-password: {{ .Values.redis.vault.secretPath | quote }}
+        vault.hashicorp.com/agent-inject-template-redis-password: |
+          {{`{{- with secret "`}}{{ .Values.redis.vault.secretPath }}{{`" -}}{{ .Data.data.password }}{{- end -}}`}}
+        {{- end }}
       labels:
         {{- include "harbor-router.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
@@ -93,6 +99,29 @@ spec:
               value: ":{{ .Values.ports.http }}"
             - name: METRICS_ADDR
               value: ":{{ .Values.ports.metrics }}"
+            {{- if .Values.redis.sentinels }}
+            - name: REDIS_SENTINELS
+              value: {{ .Values.redis.sentinels | quote }}
+            - name: REDIS_MASTER_NAME
+              value: {{ .Values.redis.masterName | quote }}
+            - name: REDIS_DB
+              value: {{ .Values.redis.db | quote }}
+            - name: REDIS_KEY_PREFIX
+              value: {{ .Values.redis.keyPrefix | quote }}
+            {{- if .Values.redis.vault.enabled }}
+            - name: REDIS_PASSWORD_FILE
+              value: "/vault/secrets/redis-password"
+            {{- else if .Values.redis.auth.existingSecret }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.redis.auth.existingSecret }}
+                  key: password
+            {{- else if .Values.redis.auth.password }}
+            - name: REDIS_PASSWORD
+              value: {{ .Values.redis.auth.password | quote }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.harbor.vault.enabled }}
             # Vault Agent Injector: read credentials from files
             - name: HARBOR_USERNAME_FILE

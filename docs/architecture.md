@@ -5,23 +5,23 @@ How harbor-router works internally. Read this before touching the code.
 ## Overview
 
 ```
-                        ┌─────────────────────────────────────────────┐
-                        │                harbor-router                 │
-                        │                                              │
- Docker client          │  ┌──────────┐   ┌──────────┐  ┌─────────┐  │
- ──────────────────────►│  │  proxy   │──►│ resolver │─►│  cache  │  │
- GET /v2/proxy/nginx/   │  │ (axum)   │   │          │  │  (moka) │  │
- manifests/latest       │  └──────────┘   └────┬─────┘  └─────────┘  │
-                        │                      │                       │
-                        │               ┌──────▼──────┐               │
-                        │               │  discovery  │               │
-                        │               │ (arc-swap)  │               │
-                        │               └─────────────┘               │
-                        └─────────────────────────────────────────────┘
-                                              │
-                              ┌───────────────┼───────────────┐
-                              ▼               ▼               ▼
-                         Harbor:dockerhub  Harbor:ghcr   Harbor:quay
+                        ┌──────────────────────────────────────────────────┐
+                        │                  harbor-router                    │
+                        │                                                   │
+ Docker client          │  ┌──────────┐   ┌──────────┐  ┌──────────────┐  │
+ ──────────────────────►│  │  proxy   │──►│ resolver │─►│    cache     │  │
+ GET /v2/proxy/nginx/   │  │ (axum)   │   │          │  │ (moka/redis) │  │
+ manifests/latest       │  └──────────┘   └────┬─────┘  └──────┬───────┘  │
+                        │                      │               │           │
+                        │               ┌──────▼──────┐        │           │
+                        │               │  discovery  │────────┘           │
+                        │               │ (arc-swap)  │                    │
+                        │               └─────────────┘                    │
+                        └──────────────────────────────────────────────────┘
+                                              │                 │ (optional)
+                              ┌───────────────┼──────────┐      ▼
+                              ▼               ▼          ▼  Redis Sentinel
+                         Harbor:dockerhub  Harbor:ghcr  Harbor:quay
 ```
 
 ## Modules
@@ -30,8 +30,8 @@ How harbor-router works internally. Read this before touching the code.
 |---|---|---|
 | `main` | `src/main.rs` | Runtime setup, TCP listener, server wiring, health/metrics endpoints |
 | `config` | `src/config.rs` | Env var loading, Go-style duration parsing, `*_FILE` secret support |
-| `discovery` | `src/discovery.rs` | Periodic Harbor API polling, lock-free project list via `ArcSwap` |
-| `cache` | `src/cache.rs` | TTL cache wrapping `moka`, 500k entry capacity |
+| `discovery` | `src/discovery.rs` | Periodic Harbor API polling, lock-free project list via `ArcSwap`, Redis-backed warm start |
+| `cache` | `src/cache.rs` | `CacheBackend` trait with Moka (in-memory) and Redis Sentinel backends |
 | `resolver` | `src/resolver.rs` | Singleflight + parallel fan-out + cache integration |
 | `proxy` | `src/proxy.rs` | Axum handlers, blob streaming, path parsing, logging middleware |
 | `metrics` | `src/metrics.rs` | Prometheus counters/histograms, image popularity tracking |
@@ -110,6 +110,15 @@ The project list is stored in an `ArcSwap<Vec<String>>`. Reads (`get_projects()`
 
 On startup, the router waits 500ms after spawning the discovery task before accepting traffic, giving it time to populate the project list.
 
+### Cache-backed warm start
+
+When a shared cache (Redis Sentinel) is configured, the discoverer:
+
+1. **Seeds from cache on startup** — reads the project list from Redis key `discovery:projects` before the first API call. This gives new pods an instant warm start without waiting for the Harbor API.
+2. **Persists after each refresh** — writes the project list to Redis as a JSON array after every successful API poll. Other pods (or the same pod after a restart) can pick it up immediately.
+
+If Redis is unavailable, the discoverer silently falls back to the standard behavior (API-only discovery). The cache key uses the same TTL as all other cache entries.
+
 ## Cache
 
 Two-level cache in `resolver`:
@@ -118,12 +127,20 @@ Two-level cache in `resolver`:
 |---|---|---|
 | `image:reference` | project name | Manifest resolved successfully |
 | `img:image` | project name | Same — used as fallback for blob routing |
+| `discovery:projects` | JSON array of project names | After each successful discovery refresh |
 
-Backed by `moka` (Rust port of Caffeine). Configured with:
-- 500k entry capacity
-- LRU eviction when full
-- Per-entry TTL set by `CACHE_TTL` (default 5 minutes)
-- Concurrent access without external locking
+### Cache backends
+
+The cache is abstracted behind the `CacheBackend` async trait, with two implementations:
+
+| Backend | When | Characteristics |
+|---|---|---|
+| **Moka** (default) | `REDIS_SENTINELS` not set | In-memory, lock-free, per-pod. 500k entry capacity, LRU eviction, per-entry TTL. Zero config. |
+| **Redis Sentinel** | `REDIS_SENTINELS` set | Shared across all pods via Redis Sentinel HA. Falls back to a local Moka cache when Redis is unreachable. Keys are prefixed with `REDIS_KEY_PREFIX` (default `hr`). |
+
+Both backends are interchangeable at runtime — the resolver and discoverer use `Cache = Arc<dyn CacheBackend>` and don't know which backend is active.
+
+The Redis backend stores each entry with a TTL matching `CACHE_TTL`. On every operation (get/set/delete), it acquires an async connection from the `SentinelClient`. If the connection or command fails, it silently falls back to the local Moka cache, so requests are never blocked by a Redis outage.
 
 ## HTTP clients
 

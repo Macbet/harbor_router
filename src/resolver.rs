@@ -1,4 +1,4 @@
-use crate::{cache::TtlCache, discovery::Discoverer, metrics};
+use crate::{cache, discovery, discovery::Discoverer, metrics};
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tracing::{debug, info};
 
 /// Outcome of a successful manifest lookup against a specific project.
@@ -24,8 +24,10 @@ pub struct ResolveResult {
 /// one in-flight task and all receive the same result, reducing upstream load.
 ///
 /// Uses DashMap for lock-free concurrent access — critical for 500k RPS.
+/// Uses `watch` channel instead of `broadcast` so late subscribers always see
+/// the result (watch retains the latest value).
 struct Flight {
-    tx: broadcast::Sender<Result<Arc<ResolveResult>, String>>,
+    tx: watch::Sender<Option<Result<Arc<ResolveResult>, String>>>,
 }
 
 /// Lock-free singleflight map using DashMap.
@@ -44,7 +46,7 @@ type Flights = Arc<DashMap<String, Arc<Flight>>>;
 #[derive(Clone)]
 pub struct Resolver {
     discovery: Discoverer,
-    cache: TtlCache,
+    cache: cache::Cache,
     client: reqwest::Client,
     harbor_url: Arc<String>, // Arc to avoid cloning on every request
     timeout: Duration,
@@ -57,7 +59,7 @@ impl Resolver {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         discovery: Discoverer,
-        cache: TtlCache,
+        cache: cache::Cache,
         harbor_url: &str,
         timeout: Duration,
         max_idle_conns_per_host: usize,
@@ -112,7 +114,7 @@ impl Resolver {
         let start = Instant::now();
 
         // Fast path: cache hit.
-        if let Some(project) = self.cache.get(&cache_key) {
+        if let Some(project) = self.cache.get(&cache_key).await {
             metrics::global()
                 .cache_lookups_total
                 .with_label_values(&["hit"])
@@ -139,7 +141,7 @@ impl Resolver {
                 }
                 _ => {
                     // Stale — evict and fall through.
-                    self.cache.delete(&cache_key);
+                    self.cache.delete(&cache_key).await;
                     debug!(
                         event = "cache",
                         image,
@@ -169,8 +171,10 @@ impl Resolver {
                     .with_label_values(&["miss"])
                     .observe(elapsed);
                 // Populate cache.
-                self.cache.set(cache_key, r.project.clone());
-                self.cache.set(format!("img:{}", image), r.project.clone());
+                self.cache.set(cache_key, r.project.clone()).await;
+                self.cache
+                    .set(format!("img:{}", image), r.project.clone())
+                    .await;
             }
             Err(_) => {
                 metrics::global()
@@ -184,12 +188,12 @@ impl Resolver {
 
     /// Returns the cached project for an image+reference (for blob routing).
     #[inline]
-    pub fn cached_project(&self, image: &str, reference: &str) -> Option<String> {
+    pub async fn cached_project(&self, image: &str, reference: &str) -> Option<String> {
         let key = format!("{}:{}", image, reference);
-        if let Some(p) = self.cache.get(&key) {
+        if let Some(p) = self.cache.get(&key).await {
             return Some(p);
         }
-        self.cache.get(&format!("img:{}", image))
+        self.cache.get(&format!("img:{}", image)).await
     }
 
     #[inline]
@@ -209,26 +213,18 @@ impl Resolver {
     ) -> Result<Arc<ResolveResult>> {
         // Try to become the leader for this key using DashMap's entry API.
         // This is lock-free: DashMap uses fine-grained sharding.
+        //
+        // We use `watch` instead of `broadcast` so that late subscribers
+        // (who subscribe after the leader sends) still see the result via
+        // `borrow()` — watch always retains the latest value.
         let (tx, is_leader) = {
-            // Check if flight exists
-            if let Some(flight) = self.flights.get(&key) {
-                // Already in-flight: subscribe and wait
-                (flight.tx.clone(), false)
-            } else {
-                // Try to insert ourselves as leader
-                let (tx, _rx) = broadcast::channel(1);
-                let flight = Arc::new(Flight { tx: tx.clone() });
-
-                // Use entry API for atomic insert-if-absent
-                match self.flights.entry(key.clone()) {
-                    dashmap::mapref::entry::Entry::Occupied(e) => {
-                        // Someone else won the race
-                        (e.get().tx.clone(), false)
-                    }
-                    dashmap::mapref::entry::Entry::Vacant(e) => {
-                        e.insert(flight);
-                        (tx, true)
-                    }
+            match self.flights.entry(key.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(e) => (e.get().tx.clone(), false),
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    let (tx, _rx) = watch::channel(None);
+                    let flight = Arc::new(Flight { tx: tx.clone() });
+                    e.insert(flight);
+                    (tx, true)
                 }
             }
         };
@@ -243,10 +239,20 @@ impl Resolver {
                 "waiting for leader"
             );
             let mut rx = tx.subscribe();
-            return rx
-                .recv()
+            // Check if result is already available (leader finished before we subscribed).
+            {
+                let current = rx.borrow_and_update();
+                if let Some(ref result) = *current {
+                    return result.clone().map_err(|e| anyhow!("{}", e));
+                }
+            }
+            // Not yet — wait for the leader to finish.
+            rx.changed()
                 .await
-                .map_err(|_| anyhow!("singleflight: leader dropped channel"))?
+                .map_err(|_| anyhow!("singleflight: leader dropped channel"))?;
+            let result = rx.borrow().clone();
+            return result
+                .ok_or_else(|| anyhow!("singleflight: leader sent empty result"))?
                 .map_err(|e| anyhow!("{}", e));
         }
 
@@ -256,9 +262,9 @@ impl Resolver {
             .await
             .map(Arc::new);
 
-        // Broadcast result to waiters.
-        let broadcast_val = res.as_ref().map(Arc::clone).map_err(|e| e.to_string());
-        let _ = tx.send(broadcast_val); // ignore if no receivers
+        // Publish result to waiters (watch retains value for late subscribers).
+        let watch_val = res.as_ref().map(Arc::clone).map_err(|e| e.to_string());
+        let _ = tx.send(Some(watch_val));
 
         // Remove from in-flight map.
         self.flights.remove(&key);
@@ -387,6 +393,12 @@ impl Resolver {
         auth: Option<&str>,
         accept: &[String],
     ) -> Result<ResolveResult> {
+        if !discovery::is_safe_project_name(project) {
+            bail!(
+                "refusing unsafe project name in URL construction: {}",
+                project
+            );
+        }
         let url = format!(
             "{}/v2/{}/{}/manifests/{}",
             self.harbor_url, project, image, reference
@@ -429,7 +441,7 @@ impl Resolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::TtlCache;
+    use crate::cache::MokaCache;
     use crate::discovery::Discoverer;
     use secrecy::SecretString;
     use std::time::Duration;
@@ -442,8 +454,9 @@ mod tests {
             mock_server_uri,
             SecretString::from("user".to_string()),
             SecretString::from("pass".to_string()),
+            None,
         );
-        let cache = TtlCache::new(Duration::from_secs(60));
+        let cache = MokaCache::build(Duration::from_secs(60));
 
         // Build a client that can handle plain HTTP (wiremock doesn't use TLS)
         let client = reqwest::Client::builder()
@@ -470,7 +483,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         let resolver = setup_test_resolver(&mock_server.uri());
 
-        assert_eq!(resolver.cached_project("nginx", "latest"), None);
+        assert_eq!(resolver.cached_project("nginx", "latest").await, None);
     }
 
     #[tokio::test]
@@ -481,10 +494,11 @@ mod tests {
         // Manually populate the cache
         resolver
             .cache
-            .set("nginx:latest".to_string(), "dockerhub".to_string());
+            .set("nginx:latest".to_string(), "dockerhub".to_string())
+            .await;
 
         assert_eq!(
-            resolver.cached_project("nginx", "latest"),
+            resolver.cached_project("nginx", "latest").await,
             Some("dockerhub".to_string())
         );
     }
@@ -497,11 +511,12 @@ mod tests {
         // Set image-level cache (used for blob routing)
         resolver
             .cache
-            .set("img:nginx".to_string(), "dockerhub".to_string());
+            .set("img:nginx".to_string(), "dockerhub".to_string())
+            .await;
 
         // Should fallback to image-level when exact key not found
         assert_eq!(
-            resolver.cached_project("nginx", "sha256:abc123"),
+            resolver.cached_project("nginx", "sha256:abc123").await,
             Some("dockerhub".to_string())
         );
     }

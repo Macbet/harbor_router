@@ -46,6 +46,19 @@ pub struct Config {
     /// Maximum requests per IP per second (0 = unlimited).
     pub rate_limit_per_ip: u32,
 
+    // Redis cache (optional — when set, uses Redis Sentinel instead of in-memory Moka)
+    /// Comma-separated Redis Sentinel endpoints (e.g. "sentinel1:26379,sentinel2:26379").
+    /// Leave empty to use the default in-memory cache.
+    pub redis_sentinels: String,
+    /// Sentinel master group name (default: "mymaster").
+    pub redis_master_name: String,
+    /// Optional Redis AUTH password.
+    pub redis_password: Option<SecretString>,
+    /// Redis database number (default: 0).
+    pub redis_db: u8,
+    /// Key prefix for cache entries (default: "hr").
+    pub redis_key_prefix: String,
+
     // Observability
     pub log_level: String,
     pub log_format: String,
@@ -72,6 +85,11 @@ impl std::fmt::Debug for Config {
             .field("max_fanout_projects", &self.max_fanout_projects)
             .field("http2_prior_knowledge", &self.http2_prior_knowledge)
             .field("rate_limit_per_ip", &self.rate_limit_per_ip)
+            .field("redis_sentinels", &self.redis_sentinels)
+            .field("redis_master_name", &self.redis_master_name)
+            .field("redis_password", &"[REDACTED]")
+            .field("redis_db", &self.redis_db)
+            .field("redis_key_prefix", &self.redis_key_prefix)
             .field("log_level", &self.log_level)
             .field("log_format", &self.log_format)
             .field("enable_pprof", &self.enable_pprof)
@@ -98,6 +116,14 @@ impl Clone for Config {
             max_fanout_projects: self.max_fanout_projects,
             http2_prior_knowledge: self.http2_prior_knowledge,
             rate_limit_per_ip: self.rate_limit_per_ip,
+            redis_sentinels: self.redis_sentinels.clone(),
+            redis_master_name: self.redis_master_name.clone(),
+            redis_password: self
+                .redis_password
+                .as_ref()
+                .map(|s| SecretString::from(s.expose_secret().to_string())),
+            redis_db: self.redis_db,
+            redis_key_prefix: self.redis_key_prefix.clone(),
             log_level: self.log_level.clone(),
             log_format: self.log_format.clone(),
             enable_pprof: self.enable_pprof,
@@ -144,6 +170,25 @@ impl Config {
             max_fanout_projects: env_usize("MAX_FANOUT_PROJECTS", 50),
             http2_prior_knowledge: env_bool("HTTP2_PRIOR_KNOWLEDGE", false),
             rate_limit_per_ip: env_u32("RATE_LIMIT_PER_IP", 0), // 0 = unlimited
+            // Redis cache (optional)
+            redis_sentinels: env_str("REDIS_SENTINELS", ""),
+            redis_master_name: env_str("REDIS_MASTER_NAME", "mymaster"),
+            redis_password: {
+                let v = env_str_or_file("REDIS_PASSWORD")?;
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(SecretString::from(v))
+                }
+            },
+            redis_db: {
+                let v = env_u32("REDIS_DB", 0);
+                if v > 15 {
+                    bail!("REDIS_DB must be 0-15, got {}", v);
+                }
+                v as u8
+            },
+            redis_key_prefix: env_str("REDIS_KEY_PREFIX", "hr"),
             // Observability
             log_level: env_str("LOG_LEVEL", "info"),
             log_format: env_str("LOG_FORMAT", "pretty"), // "pretty" or "json"

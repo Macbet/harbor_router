@@ -1,4 +1,4 @@
-use crate::{metrics, resolver::Resolver};
+use crate::{discovery, metrics, resolver::Resolver};
 
 /// RAII guard that decrements the in-flight counter when dropped.
 struct InflightGuard;
@@ -204,7 +204,7 @@ async fn handle_blob(
     // Track blob request for image popularity metrics
     metrics::global().record_blob_request(image);
 
-    let project = match state.resolver.cached_project(image, digest) {
+    let project = match state.resolver.cached_project(image, digest).await {
         Some(p) => p,
         None => {
             // Fallback: parallel HEAD probe to find which project has this blob.
@@ -255,6 +255,17 @@ async fn proxy_blob(
     auth: Option<&str>,
     method: http::Method,
 ) -> Response {
+    if !discovery::is_safe_project_name(project) {
+        error!(
+            event = "blob_proxy",
+            project, "refusing unsafe project name in URL construction"
+        );
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_UNKNOWN",
+            "internal routing error",
+        );
+    }
     let target_url = format!(
         "{}/v2/{}/{}/blobs/{}",
         state.harbor_url, project, image, digest
@@ -314,6 +325,7 @@ async fn probe_blob_project(
 
     let futures: Vec<_> = projects
         .iter()
+        .filter(|proj| discovery::is_safe_project_name(proj))
         .map(|proj| {
             let proj = proj.clone();
             let url = format!("{}/v2/{}/{}/blobs/{}", harbor_url, proj, image, digest);
