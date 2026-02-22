@@ -17,15 +17,18 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::future::join_all;
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tracing::{debug, error, info, warn};
 
 /// Shared handler state, cheaply cloneable via `Arc`.
 #[derive(Clone)]
 pub struct AppState {
     pub resolver: Resolver,
-    pub harbor_url: Arc<String>,      // Arc to avoid cloning
-    pub proxy_project: Arc<String>,   // Arc to avoid cloning
+    pub harbor_url: Arc<String>,    // Arc to avoid cloning
+    pub proxy_project: Arc<String>, // Arc to avoid cloning
     /// Dedicated reqwest client tuned for large blob streaming.
     pub blob_client: reqwest::Client,
 }
@@ -45,7 +48,7 @@ impl AppState {
             .pool_idle_timeout(Duration::from_secs(90))
             // TCP optimizations
             .tcp_keepalive(Duration::from_secs(30))
-            .tcp_nodelay(true)  // Disable Nagle's algorithm
+            .tcp_nodelay(true) // Disable Nagle's algorithm
             .connect_timeout(Duration::from_secs(5))
             // Do not follow redirects; we want to stream directly from Harbor storage.
             .redirect(reqwest::redirect::Policy::none());
@@ -89,7 +92,7 @@ pub async fn registry_handler(
     let _guard = InflightGuard;
 
     let path = req.uri().path();
-    
+
     // Fast prefix check without allocation
     let prefix_len = 4 + state.proxy_project.len() + 1; // "/v2/" + project + "/"
     let remainder = if path.len() > prefix_len {
@@ -118,7 +121,14 @@ pub async fn registry_handler(
             error_response(StatusCode::BAD_REQUEST, "UNSUPPORTED", &e.to_string())
         }
         Ok((image, PathKind::Manifests, reference)) => {
-            handle_manifest(&state, image, reference, auth_header.as_deref(), &accept_headers).await
+            handle_manifest(
+                &state,
+                image,
+                reference,
+                auth_header.as_deref(),
+                &accept_headers,
+            )
+            .await
         }
         Ok((image, PathKind::Blobs, digest)) => {
             handle_blob(&state, image, digest, auth_header, method).await
@@ -171,10 +181,10 @@ async fn handle_manifest(
                 result = "ok",
                 "manifest resolved"
             );
-            
+
             // Track image popularity for metrics
             metrics::global().record_manifest_request(image, reference);
-            
+
             build_response(r.status, &r.headers, r.body.clone())
         }
     }
@@ -190,7 +200,7 @@ async fn handle_blob(
     method: http::Method,
 ) -> Response {
     let start = Instant::now();
-    
+
     // Track blob request for image popularity metrics
     metrics::global().record_blob_request(image);
 
@@ -269,8 +279,8 @@ async fn proxy_blob(
             error_response(StatusCode::BAD_GATEWAY, "BLOB_UNKNOWN", "upstream error")
         }
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut headers = HeaderMap::new();
             copy_headers(resp.headers(), &mut headers);
 
@@ -306,10 +316,7 @@ async fn probe_blob_project(
         .iter()
         .map(|proj| {
             let proj = proj.clone();
-            let url = format!(
-                "{}/v2/{}/{}/blobs/{}",
-                harbor_url, proj, image, digest
-            );
+            let url = format!("{}/v2/{}/{}/blobs/{}", harbor_url, proj, image, digest);
             let client = state.blob_client.clone();
             let auth = auth.clone();
             async move {
@@ -468,7 +475,7 @@ fn parse_path(path: &str) -> anyhow::Result<(&str, PathKind, &str)> {
         }
         return Ok((image, PathKind::Manifests, reference));
     }
-    
+
     if let Some(idx) = path.rfind("/blobs/") {
         let image = &path[..idx];
         let reference = &path[idx + 7..]; // "/blobs/".len() == 7
@@ -495,7 +502,11 @@ fn copy_headers(src: &reqwest::header::HeaderMap, dst: &mut HeaderMap) {
 }
 
 #[inline]
-fn build_response(status: u16, upstream_headers: &reqwest::header::HeaderMap, body: Bytes) -> Response {
+fn build_response(
+    status: u16,
+    upstream_headers: &reqwest::header::HeaderMap,
+    body: Bytes,
+) -> Response {
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut headers = HeaderMap::with_capacity(upstream_headers.len());
     copy_headers(upstream_headers, &mut headers);
@@ -508,13 +519,14 @@ fn build_response(status: u16, upstream_headers: &reqwest::header::HeaderMap, bo
 /// Pre-allocated error response JSON template
 #[inline]
 fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = format!(r#"{{"errors":[{{"code":"{}","message":"{}"}}]}}"#, code, message);
+    let body = format!(
+        r#"{{"errors":[{{"code":"{}","message":"{}"}}]}}"#,
+        code, message
+    );
     let mut resp = Response::new(Body::from(body));
     *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        "Content-Type",
-        HeaderValue::from_static("application/json"),
-    );
+    resp.headers_mut()
+        .insert("Content-Type", HeaderValue::from_static("application/json"));
     resp
 }
 
@@ -524,7 +536,7 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
 fn sanitize_log_field(s: &str) -> String {
     // Truncate very long paths to prevent log flooding
     let truncated = if s.len() > 512 { &s[..512] } else { s };
-    
+
     // Replace control characters and newlines with safe representations
     truncated
         .chars()
@@ -569,8 +581,10 @@ mod tests {
 
     #[test]
     fn test_parse_path_blob_simple() {
-        let (image, kind, reference) =
-            parse_path("nginx/blobs/sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap();
+        let (image, kind, reference) = parse_path(
+            "nginx/blobs/sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
         assert_eq!(image, "nginx");
         assert_eq!(kind, PathKind::Blobs);
         assert_eq!(
@@ -581,8 +595,7 @@ mod tests {
 
     #[test]
     fn test_parse_path_blob_nested_image() {
-        let (image, kind, reference) =
-            parse_path("grafana/grafana/blobs/sha256:abc123").unwrap();
+        let (image, kind, reference) = parse_path("grafana/grafana/blobs/sha256:abc123").unwrap();
         assert_eq!(image, "grafana/grafana");
         assert_eq!(kind, PathKind::Blobs);
         assert_eq!(reference, "sha256:abc123");
@@ -592,21 +605,30 @@ mod tests {
     fn test_parse_path_missing_manifests_or_blobs() {
         let result = parse_path("nginx/tags/list");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("/manifests/ or /blobs/"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("/manifests/ or /blobs/"));
     }
 
     #[test]
     fn test_parse_path_empty_image() {
         let result = parse_path("/manifests/latest");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("missing image or reference"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing image or reference"));
     }
 
     #[test]
     fn test_parse_path_empty_reference() {
         let result = parse_path("nginx/manifests/");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("missing image or reference"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing image or reference"));
     }
 
     #[test]
@@ -619,8 +641,7 @@ mod tests {
     fn test_parse_path_uses_last_match() {
         // Edge case: image name contains "manifests" or "blobs"
         // Should use rfind to get the last occurrence
-        let (image, kind, reference) =
-            parse_path("my-manifests-project/manifests/v1.0.0").unwrap();
+        let (image, kind, reference) = parse_path("my-manifests-project/manifests/v1.0.0").unwrap();
         assert_eq!(image, "my-manifests-project");
         assert_eq!(kind, PathKind::Manifests);
         assert_eq!(reference, "v1.0.0");

@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     // Build a custom runtime optimized for high RPS
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(num_cpus::get() * 2) // 2x CPU cores for I/O-bound work
-        .max_blocking_threads(512)           // For any blocking operations
+        .max_blocking_threads(512) // For any blocking operations
         .enable_all()
         .thread_name("harbor-worker")
         .build()?;
@@ -55,15 +55,18 @@ async fn async_main() -> Result<()> {
     // ── logging ──────────────────────────────────────────────────────────────
     let filter = EnvFilter::new(match cfg.log_level.as_str() {
         "debug" => "harbor_router=debug",
-        "warn"  => "harbor_router=warn",
+        "warn" => "harbor_router=warn",
         "error" => "harbor_router=error",
-        _       => "harbor_router=info",
+        _ => "harbor_router=info",
     });
 
     // Custom timestamp format: dd-mm-yy hh:mm:ss
-    let timer = UtcTime::new(time::format_description::parse(
-        "[day]-[month]-[year repr:last_two] [hour]:[minute]:[second]"
-    ).expect("valid time format"));
+    let timer = UtcTime::new(
+        time::format_description::parse(
+            "[day]-[month]-[year repr:last_two] [hour]:[minute]:[second]",
+        )
+        .expect("valid time format"),
+    );
 
     match cfg.log_format.as_str() {
         "json" => {
@@ -75,10 +78,10 @@ async fn async_main() -> Result<()> {
                 .json()
                 .with_env_filter(filter)
                 .with_current_span(false)
-                .flatten_event(true)      // Flatten fields into top level
-                .with_file(false)         // No source file (reduces noise)
-                .with_line_number(false)  // No line numbers
-                .with_thread_ids(false)   // No thread IDs
+                .flatten_event(true) // Flatten fields into top level
+                .with_file(false) // No source file (reduces noise)
+                .with_line_number(false) // No line numbers
+                .with_thread_ids(false) // No thread IDs
                 .with_thread_names(false) // No thread names
                 .init();
         }
@@ -164,8 +167,14 @@ async fn async_main() -> Result<()> {
         .route("/v2/", get(proxy::v2_check))
         .route(&prefix, any(proxy::registry_handler))
         .route(&prefix_wildcard, any(proxy::registry_handler))
-        .route("/healthz", get(move || health_handler(disc_for_health.clone())))
-        .route("/readyz",  get(move || ready_handler(disc_for_ready.clone())))
+        .route(
+            "/healthz",
+            get(move || health_handler(disc_for_health.clone())),
+        )
+        .route(
+            "/readyz",
+            get(move || ready_handler(disc_for_ready.clone())),
+        )
         .layer(middleware::from_fn(move |req, next| {
             rate_limit_middleware(rate_limiter_for_middleware.clone(), req, next)
         }))
@@ -182,7 +191,10 @@ async fn async_main() -> Result<()> {
     let main_listener = create_optimized_listener(main_addr, cfg.listen_backlog)?;
     let metrics_listener = TcpListener::bind(metrics_addr).await?;
 
-    info!("main server listening on {} (SO_REUSEPORT enabled)", main_addr);
+    info!(
+        "main server listening on {} (SO_REUSEPORT enabled)",
+        main_addr
+    );
     info!("metrics server listening on {}", metrics_addr);
 
     // ── serve with graceful shutdown ──────────────────────────────────────────
@@ -192,13 +204,17 @@ async fn async_main() -> Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal());
 
-    let metrics_server = axum::serve(metrics_listener, metrics_app)
-        .with_graceful_shutdown(shutdown_signal());
+    let metrics_server =
+        axum::serve(metrics_listener, metrics_app).with_graceful_shutdown(shutdown_signal());
 
     let (r1, r2) = tokio::join!(main_server, metrics_server);
 
-    if let Err(e) = r1 { error!(error = %e, "main server error"); }
-    if let Err(e) = r2 { error!(error = %e, "metrics server error"); }
+    if let Err(e) = r1 {
+        error!(error = %e, "main server error");
+    }
+    if let Err(e) = r2 {
+        error!(error = %e, "metrics server error");
+    }
 
     disc_handle.abort();
     info!("harbor-router stopped");
@@ -208,7 +224,11 @@ async fn async_main() -> Result<()> {
 // ─── Optimized TCP listener with SO_REUSEPORT ─────────────────────────────────
 
 fn create_optimized_listener(addr: SocketAddr, backlog: u32) -> Result<TcpListener> {
-    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
     // SO_REUSEADDR: Allow rebinding immediately after restart
@@ -259,7 +279,10 @@ async fn health_handler(disc: discovery::Discoverer) -> impl IntoResponse {
 async fn ready_handler(disc: discovery::Discoverer) -> impl IntoResponse {
     let projects = disc.get_projects();
     if projects.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, r#"{"ready":false}"#.to_string());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"ready":false}"#.to_string(),
+        );
     }
     (
         StatusCode::OK,

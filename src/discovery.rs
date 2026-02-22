@@ -79,9 +79,7 @@ impl Discoverer {
             Ok(projects) => {
                 let count = projects.len();
                 self.inner.projects.store(Arc::new(projects));
-                metrics::global()
-                    .discovered_projects
-                    .set(count as f64);
+                metrics::global().discovered_projects.set(count as f64);
                 info!(
                     event = "discovery",
                     project_count = count,
@@ -139,10 +137,8 @@ impl Discoverer {
                 bail!("unexpected status {}: {}", status, body);
             }
 
-            let projects: Vec<HarborProject> = resp
-                .json()
-                .await
-                .context("unmarshal projects response")?;
+            let projects: Vec<HarborProject> =
+                resp.json().await.context("unmarshal projects response")?;
 
             let fetched = projects.len();
             for p in projects {

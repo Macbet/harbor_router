@@ -46,7 +46,7 @@ pub struct Resolver {
     discovery: Discoverer,
     cache: TtlCache,
     client: reqwest::Client,
-    harbor_url: Arc<String>,  // Arc to avoid cloning on every request
+    harbor_url: Arc<String>, // Arc to avoid cloning on every request
     timeout: Duration,
     flights: Flights,
     /// Maximum number of projects to fan out to (DoS protection).
@@ -73,7 +73,7 @@ impl Resolver {
             .pool_idle_timeout(idle_conn_timeout)
             // TCP optimizations
             .tcp_keepalive(Duration::from_secs(30))
-            .tcp_nodelay(true)  // Disable Nagle's algorithm
+            .tcp_nodelay(true) // Disable Nagle's algorithm
             .connect_timeout(Duration::from_secs(5))
             // No global timeout - controlled per-request
             .timeout(Duration::from_secs(0))
@@ -117,7 +117,14 @@ impl Resolver {
                 .cache_lookups_total
                 .with_label_values(&["hit"])
                 .inc();
-            debug!(event = "cache", image, reference, project, cache_result = "hit", "cache hit");
+            debug!(
+                event = "cache",
+                image,
+                reference,
+                project,
+                cache_result = "hit",
+                "cache hit"
+            );
 
             match self
                 .fetch_manifest(&project, image, reference, auth, accept)
@@ -133,7 +140,13 @@ impl Resolver {
                 _ => {
                     // Stale — evict and fall through.
                     self.cache.delete(&cache_key);
-                    debug!(event = "cache", image, reference, cache_result = "stale", "cache stale, falling through");
+                    debug!(
+                        event = "cache",
+                        image,
+                        reference,
+                        cache_result = "stale",
+                        "cache stale, falling through"
+                    );
                 }
             }
         } else {
@@ -157,8 +170,7 @@ impl Resolver {
                     .observe(elapsed);
                 // Populate cache.
                 self.cache.set(cache_key, r.project.clone());
-                self.cache
-                    .set(format!("img:{}", image), r.project.clone());
+                self.cache.set(format!("img:{}", image), r.project.clone());
             }
             Err(_) => {
                 metrics::global()
@@ -206,7 +218,7 @@ impl Resolver {
                 // Try to insert ourselves as leader
                 let (tx, _rx) = broadcast::channel(1);
                 let flight = Arc::new(Flight { tx: tx.clone() });
-                
+
                 // Use entry API for atomic insert-if-absent
                 match self.flights.entry(key.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(e) => {
@@ -223,7 +235,13 @@ impl Resolver {
 
         if !is_leader {
             metrics::global().singleflight_dedup_total.inc();
-            debug!(event = "singleflight", image, reference, role = "follower", "waiting for leader");
+            debug!(
+                event = "singleflight",
+                image,
+                reference,
+                role = "follower",
+                "waiting for leader"
+            );
             let mut rx = tx.subscribe();
             return rx
                 .recv()
@@ -239,10 +257,7 @@ impl Resolver {
             .map(Arc::new);
 
         // Broadcast result to waiters.
-        let broadcast_val = res
-            .as_ref()
-            .map(Arc::clone)
-            .map_err(|e| e.to_string());
+        let broadcast_val = res.as_ref().map(Arc::clone).map_err(|e| e.to_string());
         let _ = tx.send(broadcast_val); // ignore if no receivers
 
         // Remove from in-flight map.
@@ -280,11 +295,14 @@ impl Resolver {
         };
 
         let project_count = projects.len();
-        debug!(event = "fanout", image, reference, project_count, "parallel lookup");
+        debug!(
+            event = "fanout",
+            image, reference, project_count, "parallel lookup"
+        );
 
         // Spawn one future per project, all under the same timeout.
         let timeout = self.timeout;
-        
+
         // Pre-convert to avoid cloning in the loop
         let auth_owned = auth.map(str::to_string);
         let accept_owned: Arc<[String]> = accept.to_vec().into();
@@ -303,7 +321,13 @@ impl Resolver {
                 async move {
                     tokio::time::timeout(
                         timeout,
-                        resolver.fetch_manifest(&proj, &image, &reference, auth.as_deref(), &accept),
+                        resolver.fetch_manifest(
+                            &proj,
+                            &image,
+                            &reference,
+                            auth.as_deref(),
+                            &accept,
+                        ),
                     )
                     .await
                     .unwrap_or_else(|_| Err(anyhow!("timeout probing {}", proj)))
@@ -317,11 +341,24 @@ impl Resolver {
         for res in results {
             match res {
                 Ok(r) if r.status == 200 => {
-                    info!(event = "fanout", image, reference, project = r.project, result = "found", "resolved image");
+                    info!(
+                        event = "fanout",
+                        image,
+                        reference,
+                        project = r.project,
+                        result = "found",
+                        "resolved image"
+                    );
                     return Ok(r);
                 }
                 Ok(r) => {
-                    debug!(event = "fanout", project = r.project, status = r.status, result = "miss", "non-200 response");
+                    debug!(
+                        event = "fanout",
+                        project = r.project,
+                        status = r.status,
+                        result = "miss",
+                        "non-200 response"
+                    );
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -332,7 +369,11 @@ impl Resolver {
         if let Some(e) = last_err {
             bail!("all projects failed, last error: {}", e);
         }
-        bail!("image {}:{} not found in any proxy-cache project", image, reference);
+        bail!(
+            "image {}:{} not found in any proxy-cache project",
+            image,
+            reference
+        );
     }
 
     // ─── single fetch ─────────────────────────────────────────────────────────
@@ -359,7 +400,10 @@ impl Resolver {
             req = req.header("Accept", a.as_str());
         }
 
-        let resp = req.send().await.map_err(|e| anyhow!("request to {}: {}", project, e))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow!("request to {}: {}", project, e))?;
 
         let status = resp.status().as_u16();
         metrics::global()
@@ -435,7 +479,9 @@ mod tests {
         let resolver = setup_test_resolver(&mock_server.uri());
 
         // Manually populate the cache
-        resolver.cache.set("nginx:latest".to_string(), "dockerhub".to_string());
+        resolver
+            .cache
+            .set("nginx:latest".to_string(), "dockerhub".to_string());
 
         assert_eq!(
             resolver.cached_project("nginx", "latest"),
@@ -449,7 +495,9 @@ mod tests {
         let resolver = setup_test_resolver(&mock_server.uri());
 
         // Set image-level cache (used for blob routing)
-        resolver.cache.set("img:nginx".to_string(), "dockerhub".to_string());
+        resolver
+            .cache
+            .set("img:nginx".to_string(), "dockerhub".to_string());
 
         // Should fallback to image-level when exact key not found
         assert_eq!(
@@ -467,7 +515,10 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"schemaVersion": 2}"#)
-                    .insert_header("content-type", "application/vnd.docker.distribution.manifest.v2+json")
+                    .insert_header(
+                        "content-type",
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    )
                     .insert_header("docker-content-digest", "sha256:abc123"),
             )
             .mount(&mock_server)
@@ -511,7 +562,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/v2/dockerhub/nginx/manifests/latest"))
-            .and(wiremock::matchers::header("Authorization", "Bearer token123"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer token123",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
             .mount(&mock_server)
             .await;
