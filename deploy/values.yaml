@@ -3,7 +3,7 @@ replicaCount: 2
 
 image:
   # -- Image repository
-  repository: harbor-router
+  repository: ghcr.io/macbet/harbor-router
   # -- Image pull policy
   pullPolicy: IfNotPresent
   # -- Overrides the image tag (default is the chart appVersion)
