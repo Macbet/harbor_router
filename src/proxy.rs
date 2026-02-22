@@ -258,8 +258,7 @@ async fn proxy_blob(
     if !discovery::is_safe_project_name(project) {
         error!(
             event = "blob_proxy",
-            project,
-            "refusing unsafe project name in URL construction"
+            project, "refusing unsafe project name in URL construction"
         );
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

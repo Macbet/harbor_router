@@ -390,7 +390,10 @@ impl Resolver {
         accept: &[String],
     ) -> Result<ResolveResult> {
         if !discovery::is_safe_project_name(project) {
-            bail!("refusing unsafe project name in URL construction: {}", project);
+            bail!(
+                "refusing unsafe project name in URL construction: {}",
+                project
+            );
         }
         let url = format!(
             "{}/v2/{}/{}/manifests/{}",
