@@ -204,7 +204,7 @@ async fn handle_blob(
     // Track blob request for image popularity metrics
     metrics::global().record_blob_request(image);
 
-    let project = match state.resolver.cached_project(image, digest) {
+    let project = match state.resolver.cached_project(image, digest).await {
         Some(p) => p,
         None => {
             // Fallback: parallel HEAD probe to find which project has this blob.

@@ -45,6 +45,29 @@ config:
   # -- TCP listen backlog for connection bursts
   listenBacklog: "8192"
 
+# -- Redis Sentinel cache (optional — leave sentinels empty for in-memory Moka cache)
+redis:
+  # -- Comma-separated Redis Sentinel endpoints (e.g. "sentinel1:26379,sentinel2:26379")
+  sentinels: ""
+  # -- Sentinel master group name
+  masterName: "mymaster"
+  auth:
+    # -- Use an existing secret for Redis password.
+    # The secret must contain a `password` key.
+    existingSecret: ""
+    # -- Redis AUTH password (ignored if existingSecret is set)
+    password: ""
+  # -- Redis database number
+  db: "0"
+  # -- Key prefix for cache entries
+  keyPrefix: "hr"
+  # -- Vault Agent Injector for Redis password
+  vault:
+    # -- Enable Vault Agent Injector for Redis password
+    enabled: false
+    # -- Vault secret path for Redis password
+    secretPath: "secret/data/redis"
+
 # -- Harbor credentials
 harbor:
   auth:

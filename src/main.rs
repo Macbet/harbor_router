@@ -109,13 +109,34 @@ async fn async_main() -> Result<()> {
     );
 
     // ── core components ───────────────────────────────────────────────────────
+    let ttl_cache: cache::Cache = if cfg.redis_sentinels.is_empty() {
+        info!("cache backend: moka (in-memory)");
+        cache::MokaCache::build(cfg.cache_ttl)
+    } else {
+        info!(
+            sentinels = cfg.redis_sentinels,
+            master = cfg.redis_master_name,
+            db = cfg.redis_db,
+            prefix = cfg.redis_key_prefix,
+            "cache backend: redis sentinel"
+        );
+        cache::RedisCache::from_sentinel(
+            &cfg.redis_sentinels,
+            &cfg.redis_master_name,
+            cfg.redis_password.as_deref(),
+            cfg.redis_db,
+            cfg.cache_ttl,
+            cfg.redis_key_prefix.clone(),
+        )
+        .await?
+    };
+
     let disc = discovery::Discoverer::new(
         &cfg.harbor_url,
         secrecy::SecretString::from(cfg.harbor_username.expose_secret().to_string()),
         secrecy::SecretString::from(cfg.harbor_password.expose_secret().to_string()),
+        Some(ttl_cache.clone()),
     );
-
-    let ttl_cache = cache::TtlCache::new(cfg.cache_ttl);
 
     let res = resolver::Resolver::new(
         disc.clone(),

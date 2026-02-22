@@ -1,4 +1,4 @@
-use crate::{cache::TtlCache, discovery::Discoverer, metrics};
+use crate::{cache, discovery::Discoverer, metrics};
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -44,7 +44,7 @@ type Flights = Arc<DashMap<String, Arc<Flight>>>;
 #[derive(Clone)]
 pub struct Resolver {
     discovery: Discoverer,
-    cache: TtlCache,
+    cache: cache::Cache,
     client: reqwest::Client,
     harbor_url: Arc<String>, // Arc to avoid cloning on every request
     timeout: Duration,
@@ -57,7 +57,7 @@ impl Resolver {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         discovery: Discoverer,
-        cache: TtlCache,
+        cache: cache::Cache,
         harbor_url: &str,
         timeout: Duration,
         max_idle_conns_per_host: usize,
@@ -112,7 +112,7 @@ impl Resolver {
         let start = Instant::now();
 
         // Fast path: cache hit.
-        if let Some(project) = self.cache.get(&cache_key) {
+        if let Some(project) = self.cache.get(&cache_key).await {
             metrics::global()
                 .cache_lookups_total
                 .with_label_values(&["hit"])
@@ -139,7 +139,7 @@ impl Resolver {
                 }
                 _ => {
                     // Stale — evict and fall through.
-                    self.cache.delete(&cache_key);
+                    self.cache.delete(&cache_key).await;
                     debug!(
                         event = "cache",
                         image,
@@ -169,8 +169,10 @@ impl Resolver {
                     .with_label_values(&["miss"])
                     .observe(elapsed);
                 // Populate cache.
-                self.cache.set(cache_key, r.project.clone());
-                self.cache.set(format!("img:{}", image), r.project.clone());
+                self.cache.set(cache_key, r.project.clone()).await;
+                self.cache
+                    .set(format!("img:{}", image), r.project.clone())
+                    .await;
             }
             Err(_) => {
                 metrics::global()
@@ -184,12 +186,12 @@ impl Resolver {
 
     /// Returns the cached project for an image+reference (for blob routing).
     #[inline]
-    pub fn cached_project(&self, image: &str, reference: &str) -> Option<String> {
+    pub async fn cached_project(&self, image: &str, reference: &str) -> Option<String> {
         let key = format!("{}:{}", image, reference);
-        if let Some(p) = self.cache.get(&key) {
+        if let Some(p) = self.cache.get(&key).await {
             return Some(p);
         }
-        self.cache.get(&format!("img:{}", image))
+        self.cache.get(&format!("img:{}", image)).await
     }
 
     #[inline]
@@ -429,7 +431,7 @@ impl Resolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::TtlCache;
+    use crate::cache::MokaCache;
     use crate::discovery::Discoverer;
     use secrecy::SecretString;
     use std::time::Duration;
@@ -442,8 +444,9 @@ mod tests {
             mock_server_uri,
             SecretString::from("user".to_string()),
             SecretString::from("pass".to_string()),
+            None,
         );
-        let cache = TtlCache::new(Duration::from_secs(60));
+        let cache = MokaCache::build(Duration::from_secs(60));
 
         // Build a client that can handle plain HTTP (wiremock doesn't use TLS)
         let client = reqwest::Client::builder()
@@ -470,7 +473,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         let resolver = setup_test_resolver(&mock_server.uri());
 
-        assert_eq!(resolver.cached_project("nginx", "latest"), None);
+        assert_eq!(resolver.cached_project("nginx", "latest").await, None);
     }
 
     #[tokio::test]
@@ -481,10 +484,11 @@ mod tests {
         // Manually populate the cache
         resolver
             .cache
-            .set("nginx:latest".to_string(), "dockerhub".to_string());
+            .set("nginx:latest".to_string(), "dockerhub".to_string())
+            .await;
 
         assert_eq!(
-            resolver.cached_project("nginx", "latest"),
+            resolver.cached_project("nginx", "latest").await,
             Some("dockerhub".to_string())
         );
     }
@@ -497,11 +501,12 @@ mod tests {
         // Set image-level cache (used for blob routing)
         resolver
             .cache
-            .set("img:nginx".to_string(), "dockerhub".to_string());
+            .set("img:nginx".to_string(), "dockerhub".to_string())
+            .await;
 
         // Should fallback to image-level when exact key not found
         assert_eq!(
-            resolver.cached_project("nginx", "sha256:abc123"),
+            resolver.cached_project("nginx", "sha256:abc123").await,
             Some("dockerhub".to_string())
         );
     }
