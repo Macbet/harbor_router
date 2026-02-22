@@ -133,11 +133,18 @@ async fn async_main() -> Result<()> {
         .await?
     };
 
+    // Only pass cache to discovery when Redis is configured (cross-pod seeding
+    // has no value with in-memory-only Moka cache).
+    let disc_cache = if cfg.redis_sentinels.is_empty() {
+        None
+    } else {
+        Some(ttl_cache.clone())
+    };
     let disc = discovery::Discoverer::new(
         &cfg.harbor_url,
         secrecy::SecretString::from(cfg.harbor_username.expose_secret().to_string()),
         secrecy::SecretString::from(cfg.harbor_password.expose_secret().to_string()),
-        Some(ttl_cache.clone()),
+        disc_cache,
     );
 
     let res = resolver::Resolver::new(

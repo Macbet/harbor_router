@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tracing::{debug, info};
 
 /// Outcome of a successful manifest lookup against a specific project.
@@ -24,8 +24,10 @@ pub struct ResolveResult {
 /// one in-flight task and all receive the same result, reducing upstream load.
 ///
 /// Uses DashMap for lock-free concurrent access — critical for 500k RPS.
+/// Uses `watch` channel instead of `broadcast` so late subscribers always see
+/// the result (watch retains the latest value).
 struct Flight {
-    tx: broadcast::Sender<Result<Arc<ResolveResult>, String>>,
+    tx: watch::Sender<Option<Result<Arc<ResolveResult>, String>>>,
 }
 
 /// Lock-free singleflight map using DashMap.
@@ -211,26 +213,18 @@ impl Resolver {
     ) -> Result<Arc<ResolveResult>> {
         // Try to become the leader for this key using DashMap's entry API.
         // This is lock-free: DashMap uses fine-grained sharding.
+        //
+        // We use `watch` instead of `broadcast` so that late subscribers
+        // (who subscribe after the leader sends) still see the result via
+        // `borrow()` — watch always retains the latest value.
         let (tx, is_leader) = {
-            // Check if flight exists
-            if let Some(flight) = self.flights.get(&key) {
-                // Already in-flight: subscribe and wait
-                (flight.tx.clone(), false)
-            } else {
-                // Try to insert ourselves as leader
-                let (tx, _rx) = broadcast::channel(1);
-                let flight = Arc::new(Flight { tx: tx.clone() });
-
-                // Use entry API for atomic insert-if-absent
-                match self.flights.entry(key.clone()) {
-                    dashmap::mapref::entry::Entry::Occupied(e) => {
-                        // Someone else won the race
-                        (e.get().tx.clone(), false)
-                    }
-                    dashmap::mapref::entry::Entry::Vacant(e) => {
-                        e.insert(flight);
-                        (tx, true)
-                    }
+            match self.flights.entry(key.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(e) => (e.get().tx.clone(), false),
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    let (tx, _rx) = watch::channel(None);
+                    let flight = Arc::new(Flight { tx: tx.clone() });
+                    e.insert(flight);
+                    (tx, true)
                 }
             }
         };
@@ -245,10 +239,20 @@ impl Resolver {
                 "waiting for leader"
             );
             let mut rx = tx.subscribe();
-            return rx
-                .recv()
+            // Check if result is already available (leader finished before we subscribed).
+            {
+                let current = rx.borrow_and_update();
+                if let Some(ref result) = *current {
+                    return result.clone().map_err(|e| anyhow!("{}", e));
+                }
+            }
+            // Not yet — wait for the leader to finish.
+            rx.changed()
                 .await
-                .map_err(|_| anyhow!("singleflight: leader dropped channel"))?
+                .map_err(|_| anyhow!("singleflight: leader dropped channel"))?;
+            let result = rx.borrow().clone();
+            return result
+                .ok_or_else(|| anyhow!("singleflight: leader sent empty result"))?
                 .map_err(|e| anyhow!("{}", e));
         }
 
@@ -258,9 +262,9 @@ impl Resolver {
             .await
             .map(Arc::new);
 
-        // Broadcast result to waiters.
-        let broadcast_val = res.as_ref().map(Arc::clone).map_err(|e| e.to_string());
-        let _ = tx.send(broadcast_val); // ignore if no receivers
+        // Publish result to waiters (watch retains value for late subscribers).
+        let watch_val = res.as_ref().map(Arc::clone).map_err(|e| e.to_string());
+        let _ = tx.send(Some(watch_val));
 
         // Remove from in-flight map.
         self.flights.remove(&key);

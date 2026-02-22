@@ -181,7 +181,13 @@ impl Config {
                     Some(SecretString::from(v))
                 }
             },
-            redis_db: env_u32("REDIS_DB", 0) as u8,
+            redis_db: {
+                let v = env_u32("REDIS_DB", 0);
+                if v > 15 {
+                    bail!("REDIS_DB must be 0-15, got {}", v);
+                }
+                v as u8
+            },
             redis_key_prefix: env_str("REDIS_KEY_PREFIX", "hr"),
             // Observability
             log_level: env_str("LOG_LEVEL", "info"),

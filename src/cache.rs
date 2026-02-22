@@ -60,7 +60,14 @@ impl CacheBackend for MokaCache {
 /// Connects via Redis Sentinel for HA, or to a standalone Redis instance.
 /// Falls back to a local Moka cache when Redis is unreachable, so requests
 /// are never blocked by a Redis outage.
+///
+/// The connection (`MultiplexedConnection`) is cached and cloned for each
+/// operation — no per-request locking. The sentinel mutex is only acquired
+/// on reconnection (cold path).
 pub struct RedisCache {
+    /// Cached multiplexed connection — cloned per operation (cheap, lock-free).
+    conn: arc_swap::ArcSwap<redis::aio::MultiplexedConnection>,
+    /// Sentinel client for reconnection on failure (cold path only).
     sentinel: tokio::sync::Mutex<redis::sentinel::SentinelClient>,
     ttl_secs: u64,
     prefix: String,
@@ -107,12 +114,18 @@ impl RedisCache {
         let node_conn_info = redis::sentinel::SentinelNodeConnectionInfo::default()
             .set_redis_connection_info(redis_conn_info);
 
-        let client = redis::sentinel::SentinelClient::build(
+        let mut client = redis::sentinel::SentinelClient::build(
             sentinel_urls,
             String::from(master_name),
             Some(node_conn_info),
             redis::sentinel::SentinelServerType::Master,
         )?;
+
+        // Establish initial connection eagerly so startup fails fast on misconfiguration.
+        let conn = client
+            .get_async_connection()
+            .await
+            .map_err(|e| anyhow::anyhow!("initial Redis Sentinel connection failed: {}", e))?;
 
         let fallback = moka::sync::Cache::builder()
             .time_to_live(ttl)
@@ -120,6 +133,7 @@ impl RedisCache {
             .build();
 
         Ok(Arc::new(Self {
+            conn: arc_swap::ArcSwap::from_pointee(conn),
             sentinel: tokio::sync::Mutex::new(client),
             ttl_secs: ttl.as_secs().max(1),
             prefix,
@@ -134,55 +148,58 @@ impl RedisCache {
             format!("{}:{}", self.prefix, key)
         }
     }
+
+    /// Attempt to reconnect via Sentinel (cold path, mutex-protected).
+    async fn try_reconnect(&self) {
+        if let Ok(mut sentinel) = self.sentinel.try_lock() {
+            match sentinel.get_async_connection().await {
+                Ok(new_conn) => {
+                    self.conn.store(Arc::new(new_conn));
+                    tracing::info!("redis connection re-established via sentinel");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "redis sentinel reconnection failed");
+                }
+            }
+        }
+        // If try_lock fails, another task is already reconnecting — skip.
+    }
 }
 
 #[async_trait::async_trait]
 impl CacheBackend for RedisCache {
     async fn get(&self, key: &str) -> Option<String> {
         let redis_key = self.prefixed(key);
-        let conn = {
-            let mut sentinel = self.sentinel.lock().await;
-            sentinel.get_async_connection().await
-        };
-        match conn {
-            Ok(mut c) => {
-                match redis::AsyncCommands::get::<_, Option<String>>(&mut c, &redis_key).await {
-                    Ok(v) => v,
-                    Err(_) => self.fallback.get(key),
-                }
+        let mut conn = (*self.conn.load_full()).clone();
+        match redis::AsyncCommands::get::<_, Option<String>>(&mut conn, &redis_key).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, key, "redis GET failed, falling back to moka");
+                self.try_reconnect().await;
+                self.fallback.get(key)
             }
-            Err(_) => self.fallback.get(key),
         }
     }
 
     async fn set(&self, key: String, value: String) {
         let redis_key = self.prefixed(&key);
-        let conn = {
-            let mut sentinel = self.sentinel.lock().await;
-            sentinel.get_async_connection().await
-        };
-        match conn {
-            Ok(mut c) => {
-                let res: Result<(), _> =
-                    redis::AsyncCommands::set_ex(&mut c, &redis_key, &value, self.ttl_secs).await;
-                if res.is_err() {
-                    self.fallback.insert(key, value);
-                }
-            }
-            Err(_) => {
-                self.fallback.insert(key, value);
-            }
+        let mut conn = (*self.conn.load_full()).clone();
+        let res: Result<(), _> =
+            redis::AsyncCommands::set_ex(&mut conn, &redis_key, &value, self.ttl_secs).await;
+        if let Err(e) = res {
+            tracing::debug!(error = %e, key, "redis SET failed, falling back to moka");
+            self.try_reconnect().await;
         }
+        // Always populate local fallback for graceful degradation.
+        self.fallback.insert(key, value);
     }
 
     async fn delete(&self, key: &str) {
         let redis_key = self.prefixed(key);
-        let conn = {
-            let mut sentinel = self.sentinel.lock().await;
-            sentinel.get_async_connection().await
-        };
-        if let Ok(mut c) = conn {
-            let _: Result<(), _> = redis::AsyncCommands::del(&mut c, &redis_key).await;
+        let mut conn = (*self.conn.load_full()).clone();
+        if let Err(e) = redis::AsyncCommands::del::<_, ()>(&mut conn, &redis_key).await {
+            tracing::debug!(error = %e, key, "redis DEL failed");
+            self.try_reconnect().await;
         }
         self.fallback.invalidate(key);
     }
