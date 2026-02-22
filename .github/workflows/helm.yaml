@@ -70,8 +70,9 @@ jobs:
 
       - name: Push chart to GHCR
         run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           helm registry login ghcr.io \
             --username "${{ github.actor }}" \
             --password "${{ secrets.GITHUB_TOKEN }}"
           helm push "harbor-router-${{ steps.version.outputs.version }}.tgz" \
-            oci://ghcr.io/${{ github.repository_owner }}/charts
+            oci://ghcr.io/${OWNER}/charts

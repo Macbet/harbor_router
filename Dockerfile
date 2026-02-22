@@ -1,5 +1,5 @@
 # ── builder ───────────────────────────────────────────────────────────────────
-FROM rust:1.85-slim AS builder
+FROM rust:1.88-slim AS builder
 
 # Install build dependencies for native TLS and linking
 RUN apt-get update && \
