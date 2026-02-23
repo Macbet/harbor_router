@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use moka::Expiry;
+
 /// Async cache backend trait.
 ///
 /// Two implementations:
@@ -10,6 +12,10 @@ use std::time::Duration;
 pub trait CacheBackend: Send + Sync {
     async fn get(&self, key: &str) -> Option<String>;
     async fn set(&self, key: String, value: String);
+    #[allow(dead_code)] // Default impl for backward compatibility; overridden by implementations
+    async fn set_with_ttl(&self, key: String, value: String, _ttl: Duration) {
+        self.set(key, value).await;
+    }
     async fn delete(&self, key: &str);
 }
 
@@ -23,7 +29,37 @@ pub type Cache = Arc<dyn CacheBackend>;
 /// Backed by `moka` which provides lock-free concurrent access and
 /// automatic background eviction — equivalent to the Go sharded TTL cache.
 pub struct MokaCache {
-    inner: moka::sync::Cache<String, String>,
+    inner: moka::sync::Cache<String, MokaValue>,
+    default_ttl: Duration,
+}
+
+#[derive(Clone)]
+struct MokaValue {
+    value: String,
+    ttl: Duration,
+}
+
+struct MokaExpiry;
+
+impl Expiry<String, MokaValue> for MokaExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &MokaValue,
+        _created_at: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(value.ttl)
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        value: &MokaValue,
+        _updated_at: std::time::Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(value.ttl)
+    }
 }
 
 impl MokaCache {
@@ -31,21 +67,34 @@ impl MokaCache {
     /// Capacity set high for 500k RPS workloads with many unique images.
     pub fn build(ttl: Duration) -> Cache {
         let inner = moka::sync::Cache::builder()
-            .time_to_live(ttl)
+            .expire_after(MokaExpiry)
             .max_capacity(500_000)
             .build();
-        Arc::new(Self { inner })
+        Arc::new(Self {
+            inner,
+            default_ttl: ttl,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl CacheBackend for MokaCache {
     async fn get(&self, key: &str) -> Option<String> {
-        self.inner.get(key)
+        self.inner.get(key).map(|entry| entry.value)
     }
 
     async fn set(&self, key: String, value: String) {
-        self.inner.insert(key, value);
+        self.inner.insert(
+            key,
+            MokaValue {
+                value,
+                ttl: self.default_ttl,
+            },
+        );
+    }
+
+    async fn set_with_ttl(&self, key: String, value: String, ttl: Duration) {
+        self.inner.insert(key, MokaValue { value, ttl });
     }
 
     async fn delete(&self, key: &str) {
@@ -200,6 +249,20 @@ impl CacheBackend for RedisCache {
         self.fallback.insert(key, value);
     }
 
+    async fn set_with_ttl(&self, key: String, value: String, ttl: Duration) {
+        let redis_key = self.prefixed(&key);
+        let mut conn = (*self.conn.load_full()).clone();
+        let ttl_secs = ttl.as_secs().max(1);
+        let res: Result<(), _> =
+            redis::AsyncCommands::set_ex(&mut conn, &redis_key, &value, ttl_secs).await;
+        if let Err(e) = res {
+            tracing::debug!(error = %e, key, "redis SET failed, falling back to moka");
+            self.try_reconnect().await;
+        }
+        // Always populate local fallback for graceful degradation.
+        self.fallback.insert(key, value);
+    }
+
     async fn delete(&self, key: &str) {
         let redis_key = self.prefixed(key);
         let mut conn = (*self.conn.load_full()).clone();
@@ -284,5 +347,22 @@ mod tests {
 
         // Entry should be expired
         assert_eq!(cache.get("key").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_moka_cache_set_with_ttl() {
+        let cache = MokaCache::build(Duration::from_secs(60));
+
+        cache
+            .set_with_ttl(
+                "ttl-key".to_string(),
+                "ttl-value".to_string(),
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(cache.get("ttl-key").await, Some("ttl-value".to_string()));
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(cache.get("ttl-key").await, None);
     }
 }

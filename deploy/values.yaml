@@ -44,6 +44,14 @@ config:
   rateLimitPerIp: "0"
   # -- TCP listen backlog for connection bursts
   listenBacklog: "8192"
+  # -- How long to cache negative lookups for non-existent images
+  negativeCacheTtl: "30s"
+  # -- Serve stale cache entries while refreshing in background (0s to disable)
+  staleWhileRevalidate: "60s"
+  # -- Consecutive failures before a project circuit opens
+  circuitBreakerThreshold: "5"
+  # -- Duration to keep circuit open before probing (half-open)
+  circuitBreakerTimeout: "30s"
 
 # -- Redis Sentinel cache (optional — leave sentinels empty for in-memory Moka cache)
 # NOTE: This chart does NOT install Redis. You must deploy Redis Sentinel separately

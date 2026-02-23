@@ -35,6 +35,27 @@ How harbor-router works internally. Read this before touching the code.
 | `resolver` | `src/resolver.rs` | Singleflight + parallel fan-out + cache integration |
 | `proxy` | `src/proxy.rs` | Axum handlers, blob streaming, path parsing, logging middleware |
 | `metrics` | `src/metrics.rs` | Prometheus counters/histograms, image popularity tracking |
+| `circuit_breaker` | `src/circuit_breaker.rs` | Per-project circuit breaker with lock-free state machine |
+
+### Circuit Breaker
+
+Each proxy-cache project has its own circuit breaker to prevent cascading failures when a Harbor project becomes unhealthy. The breaker uses a lock-free state machine implemented with atomics in `DashMap<String, ProjectHealth>`.
+
+**States:**
+
+| State | Value | Behavior |
+|---|---|---|
+| **Closed** | 0 | Normal operation — requests flow to the project |
+| **Open** | 1 | Project is unhealthy — requests skip this project entirely |
+| **Half-Open** | 2 | Probing — next request to this project will test if it's recovered |
+
+**Transitions:**
+
+- **Closed → Open**: When consecutive failures reach `CIRCUIT_BREAKER_THRESHOLD` (default 5). HTTP 4xx errors are NOT counted as failures (client-side issues).
+- **Open → Half-Open**: After `CIRCUIT_BREAKER_TIMEOUT` (default 30s) has elapsed.
+- **Half-Open/Open → Closed**: On the next successful request to the project.
+
+All state transitions use `compare_exchange` for lock-free atomic updates. The breaker state is exposed as a Prometheus gauge (`harbor_router_circuit_breaker_state`) for monitoring.
 
 ## Request lifecycle
 
@@ -83,6 +104,24 @@ How harbor-router works internally. Read this before touching the code.
    - Parallel HEAD requests to all projects (5s timeout)
    - Returns first project that responds 200 or 307
 ```
+
+### Tag List request
+
+```
+1. Client: GET /v2/proxy/nginx/tags/list
+2. proxy::registry_handler — parse path → (image="nginx", kind=Tags)
+3. resolver::resolve_tags
+   a. cache.get("tags:nginx") → None (miss)
+   b. parallel_lookup across all discovered projects (no singleflight)
+      - fetch_tags("dockerhub", "nginx") → 200 ✓
+      - fetch_tags("ghcr", "nginx")      → 404
+      - fetch_tags("quay", "nginx")      → 404
+      - return first 200
+   c. cache.set("tags:nginx", "dockerhub", CACHE_TTL)
+4. Return tags JSON to client
+```
+
+Tag lists are cached with key pattern `tags:{image}` storing the project name (not the full response). Unlike manifest resolution, tag lookups do not use singleflight since they are less concurrent-hot. The cache hit path fetches directly from the known project without fan-out.
 
 ## Singleflight
 
@@ -141,6 +180,25 @@ The cache is abstracted behind the `CacheBackend` async trait, with two implemen
 Both backends are interchangeable at runtime — the resolver and discoverer use `Cache = Arc<dyn CacheBackend>` and don't know which backend is active.
 
 The Redis backend stores each entry with a TTL matching `CACHE_TTL`. On every operation (get/set/delete), it acquires an async connection from the `SentinelClient`. If the connection or command fails, it silently falls back to the local Moka cache, so requests are never blocked by a Redis outage.
+### Negative Cache
+
+When a manifest is not found in any proxy-cache project, the resolver stores a negative sentinel (`"__NEGATIVE__"`) in the cache with a shorter TTL (`NEGATIVE_CACHE_TTL`, default 30s). This prevents repeated fan-outs for non-existent images.
+
+On subsequent requests for the same image:reference:
+- Cache hit on the sentinel returns 404 immediately, skipping the fan-out
+- After the TTL expires, the next request triggers a fresh fan-out
+
+Negative caching only applies to "not found in any project" outcomes. Transport errors, timeouts, and partial failures are not cached negatively.
+### Stale-While-Revalidate
+
+When `STALE_WHILE_REVALIDATE` is enabled (non-zero), cache entries are stored with an extended TTL (`CACHE_TTL + STALE_WHILE_REVALIDATE`). The cache value is encoded as `"project|timestamp"` where timestamp is the Unix epoch seconds when the entry was created.
+
+On cache hit:
+- If `now - timestamp <= CACHE_TTL`: entry is fresh, serve immediately
+- If `CACHE_TTL < now - timestamp <= extended_TTL`: entry is stale but servable. The stale entry is returned immediately, and a background refresh is spawned via `tokio::spawn`. The refresh re-runs the full fan-out and updates the cache with a new timestamp.
+- If `now - timestamp > extended_TTL`: entry is expired, treat as cache miss
+
+This provides sub-millisecond responses even for popular images that would otherwise trigger fan-outs, at the cost of temporarily serving slightly stale data. Set `STALE_WHILE_REVALIDATE=0` to disable.
 
 ## HTTP clients
 

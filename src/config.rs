@@ -22,6 +22,12 @@ pub struct Config {
     pub resolver_timeout: Duration,
     pub cache_ttl: Duration,
 
+    // Circuit breaker & caching strategies
+    pub negative_cache_ttl: Duration,
+    pub stale_while_revalidate: Duration,
+    pub circuit_breaker_threshold: u32,
+    pub circuit_breaker_timeout: Duration,
+
     // Connection pool (tuned for 500k RPS)
     pub max_idle_conns_per_host: usize,
     #[allow(dead_code)] // Reserved for future use
@@ -78,6 +84,10 @@ impl std::fmt::Debug for Config {
             .field("discovery_interval", &self.discovery_interval)
             .field("resolver_timeout", &self.resolver_timeout)
             .field("cache_ttl", &self.cache_ttl)
+            .field("negative_cache_ttl", &self.negative_cache_ttl)
+            .field("stale_while_revalidate", &self.stale_while_revalidate)
+            .field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
+            .field("circuit_breaker_timeout", &self.circuit_breaker_timeout)
             .field("max_idle_conns_per_host", &self.max_idle_conns_per_host)
             .field("max_conns_per_host", &self.max_conns_per_host)
             .field("idle_conn_timeout", &self.idle_conn_timeout)
@@ -111,6 +121,10 @@ impl Clone for Config {
             discovery_interval: self.discovery_interval,
             resolver_timeout: self.resolver_timeout,
             cache_ttl: self.cache_ttl,
+            negative_cache_ttl: self.negative_cache_ttl,
+            stale_while_revalidate: self.stale_while_revalidate,
+            circuit_breaker_threshold: self.circuit_breaker_threshold,
+            circuit_breaker_timeout: self.circuit_breaker_timeout,
             max_idle_conns_per_host: self.max_idle_conns_per_host,
             max_conns_per_host: self.max_conns_per_host,
             idle_conn_timeout: self.idle_conn_timeout,
@@ -164,6 +178,13 @@ impl Config {
             discovery_interval: env_duration("DISCOVERY_INTERVAL", Duration::from_secs(60)),
             resolver_timeout: env_duration("RESOLVER_TIMEOUT", Duration::from_secs(10)),
             cache_ttl: env_duration("CACHE_TTL", Duration::from_secs(300)),
+            negative_cache_ttl: env_duration("NEGATIVE_CACHE_TTL", Duration::from_secs(30)),
+            stale_while_revalidate: env_duration("STALE_WHILE_REVALIDATE", Duration::from_secs(60)),
+            circuit_breaker_threshold: env_u32("CIRCUIT_BREAKER_THRESHOLD", 5),
+            circuit_breaker_timeout: env_duration(
+                "CIRCUIT_BREAKER_TIMEOUT",
+                Duration::from_secs(30),
+            ),
             // Connection pool defaults tuned for 500k RPS
             max_idle_conns_per_host: env_usize("MAX_IDLE_CONNS_PER_HOST", 512),
             max_conns_per_host: env_usize("MAX_CONNS_PER_HOST", 0),
@@ -331,6 +352,10 @@ pub fn should_warn_plaintext_url(url: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
+
+    // Global lock for env var tests to prevent race conditions
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_parse_go_duration_seconds() {
@@ -477,5 +502,112 @@ mod tests {
     #[test]
     fn test_should_warn_plaintext_url_harbor_core() {
         assert!(!should_warn_plaintext_url("http://harbor-core:80"));
+    }
+
+    // Tests for new config fields
+    #[test]
+    fn test_negative_cache_ttl_default() {
+        std::env::remove_var("NEGATIVE_CACHE_TTL");
+        let ttl = env_duration("NEGATIVE_CACHE_TTL", Duration::from_secs(30));
+        assert_eq!(ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_negative_cache_ttl_custom() {
+        std::env::remove_var("NEGATIVE_CACHE_TTL");
+        std::env::set_var("NEGATIVE_CACHE_TTL", "15s");
+        let ttl = env_duration("NEGATIVE_CACHE_TTL", Duration::from_secs(30));
+        assert_eq!(ttl, Duration::from_secs(15));
+        std::env::remove_var("NEGATIVE_CACHE_TTL");
+    }
+
+    #[test]
+    fn test_negative_cache_ttl_invalid() {
+        std::env::remove_var("NEGATIVE_CACHE_TTL");
+        std::env::set_var("NEGATIVE_CACHE_TTL", "invalid");
+        let ttl = env_duration("NEGATIVE_CACHE_TTL", Duration::from_secs(30));
+        assert_eq!(ttl, Duration::from_secs(30)); // falls back to default
+        std::env::remove_var("NEGATIVE_CACHE_TTL");
+    }
+
+    #[test]
+    fn test_stale_while_revalidate_default() {
+        std::env::remove_var("STALE_WHILE_REVALIDATE");
+        let ttl = env_duration("STALE_WHILE_REVALIDATE", Duration::from_secs(60));
+        assert_eq!(ttl, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_stale_while_revalidate_custom() {
+        std::env::remove_var("STALE_WHILE_REVALIDATE");
+        std::env::set_var("STALE_WHILE_REVALIDATE", "2m");
+        let ttl = env_duration("STALE_WHILE_REVALIDATE", Duration::from_secs(60));
+        assert_eq!(ttl, Duration::from_secs(120));
+        std::env::remove_var("STALE_WHILE_REVALIDATE");
+    }
+
+    #[test]
+    fn test_stale_while_revalidate_invalid() {
+        std::env::remove_var("STALE_WHILE_REVALIDATE");
+        std::env::set_var("STALE_WHILE_REVALIDATE", "bad");
+        let ttl = env_duration("STALE_WHILE_REVALIDATE", Duration::from_secs(60));
+        assert_eq!(ttl, Duration::from_secs(60)); // falls back to default
+        std::env::remove_var("STALE_WHILE_REVALIDATE");
+    }
+
+    #[test]
+    fn test_circuit_breaker_threshold_default() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("CIRCUIT_BREAKER_THRESHOLD");
+        let threshold = env_u32("CIRCUIT_BREAKER_THRESHOLD", 5);
+        assert_eq!(threshold, 5);
+    }
+
+    #[test]
+    fn test_circuit_breaker_threshold_custom() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("CIRCUIT_BREAKER_THRESHOLD");
+        std::env::set_var("CIRCUIT_BREAKER_THRESHOLD", "10");
+        let threshold = env_u32("CIRCUIT_BREAKER_THRESHOLD", 5);
+        assert_eq!(threshold, 10);
+        std::env::remove_var("CIRCUIT_BREAKER_THRESHOLD");
+    }
+
+    #[test]
+    fn test_circuit_breaker_threshold_invalid() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("CIRCUIT_BREAKER_THRESHOLD");
+        std::env::set_var("CIRCUIT_BREAKER_THRESHOLD", "not_a_number");
+        let threshold = env_u32("CIRCUIT_BREAKER_THRESHOLD", 5);
+        assert_eq!(threshold, 5); // falls back to default
+        std::env::remove_var("CIRCUIT_BREAKER_THRESHOLD");
+    }
+
+    #[test]
+    fn test_circuit_breaker_timeout_default() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("CIRCUIT_BREAKER_TIMEOUT");
+        let timeout = env_duration("CIRCUIT_BREAKER_TIMEOUT", Duration::from_secs(30));
+        assert_eq!(timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_circuit_breaker_timeout_custom() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("CIRCUIT_BREAKER_TIMEOUT");
+        std::env::set_var("CIRCUIT_BREAKER_TIMEOUT", "45s");
+        let timeout = env_duration("CIRCUIT_BREAKER_TIMEOUT", Duration::from_secs(30));
+        assert_eq!(timeout, Duration::from_secs(45));
+        std::env::remove_var("CIRCUIT_BREAKER_TIMEOUT");
+    }
+
+    #[test]
+    fn test_circuit_breaker_timeout_invalid() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("CIRCUIT_BREAKER_TIMEOUT");
+        std::env::set_var("CIRCUIT_BREAKER_TIMEOUT", "xyz");
+        let timeout = env_duration("CIRCUIT_BREAKER_TIMEOUT", Duration::from_secs(30));
+        assert_eq!(timeout, Duration::from_secs(30)); // falls back to default
+        std::env::remove_var("CIRCUIT_BREAKER_TIMEOUT");
     }
 }

@@ -20,6 +20,8 @@ All metrics are exposed at `:9090/metrics` and prefixed `harbor_router_`.
 | `top_manifest_images` | Gauge | `image` | Top 100 images by manifest pull count (min 10 requests) |
 | `top_blob_images` | Gauge | `image` | Top 100 images by blob pull count (min 10 requests) |
 | `tracked_images_total` | Gauge | `type` | Unique images being tracked; `type` = `manifest` / `blob` |
+| `upstream_project_duration_seconds` | Histogram | `project` | Upstream request latency per project |
+| `circuit_breaker_state` | Gauge | `project` | Circuit breaker state: 0=closed, 1=open, 2=half-open |
 
 > `top_manifest_images` and `top_blob_images` are rendered directly into the Prometheus text output — they won't appear in client-side introspection but are valid scrape targets.
 

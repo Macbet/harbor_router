@@ -95,6 +95,14 @@ spec:
               value: {{ .Values.config.rateLimitPerIp | quote }}
             - name: LISTEN_BACKLOG
               value: {{ .Values.config.listenBacklog | quote }}
+            - name: NEGATIVE_CACHE_TTL
+              value: {{ .Values.config.negativeCacheTtl | quote }}
+            - name: STALE_WHILE_REVALIDATE
+              value: {{ .Values.config.staleWhileRevalidate | quote }}
+            - name: CIRCUIT_BREAKER_THRESHOLD
+              value: {{ .Values.config.circuitBreakerThreshold | quote }}
+            - name: CIRCUIT_BREAKER_TIMEOUT
+              value: {{ .Values.config.circuitBreakerTimeout | quote }}
             - name: LISTEN_ADDR
               value: ":{{ .Values.ports.http }}"
             - name: METRICS_ADDR
