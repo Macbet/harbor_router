@@ -108,6 +108,8 @@ spec:
               value: {{ .Values.redis.db | quote }}
             - name: REDIS_KEY_PREFIX
               value: {{ .Values.redis.keyPrefix | quote }}
+            - name: REDIS_TLS
+              value: {{ .Values.redis.tls | quote }}
             {{- if .Values.redis.vault.enabled }}
             - name: REDIS_PASSWORD_FILE
               value: "/vault/secrets/redis-password"
