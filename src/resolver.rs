@@ -304,6 +304,7 @@ impl Resolver {
         self.discovery.get_projects()
     }
 
+
     // ─── singleflight (lock-free with DashMap) ───────────────────────────────
 
     async fn singleflight(
@@ -470,23 +471,46 @@ impl Resolver {
         }
 
         // Use FuturesUnordered via buffer_unordered to return as soon as the
-        // first 200 response arrives, cancelling remaining futures.
+        // first matching 200 response arrives, cancelling remaining futures.
+        // If no content-type matches the client's Accept header, fall back to
+        // the first 200 response seen (graceful degradation).
         let count = futures.len();
         let mut results = stream::iter(futures).buffer_unordered(count);
         let mut last_err: Option<anyhow::Error> = None;
-
+        let mut fallback: Option<ResolveResult> = None;
         while let Some(res) = results.next().await {
             match res {
                 Ok(r) if r.status == 200 => {
-                    info!(
+                    // Check if this response's Content-Type matches the client's Accept header.
+                    // Empty accept list means no preference — accept any 200.
+                    let ct = r
+                        .headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+
+                    if accept.is_empty() || content_type_matches(ct, accept) {
+                        info!(
+                            event = "fanout",
+                            image,
+                            reference,
+                            project = r.project,
+                            result = "found",
+                            "resolved image"
+                        );
+                        return Ok(r);
+                    }
+                    // No content-type match — save first 200 as fallback.
+                    debug!(
                         event = "fanout",
-                        image,
-                        reference,
                         project = r.project,
-                        result = "found",
-                        "resolved image"
+                        content_type = ct,
+                        result = "ct_mismatch",
+                        "200 but content-type does not match Accept"
                     );
-                    return Ok(r);
+                    if fallback.is_none() {
+                        fallback = Some(r);
+                    }
                 }
                 Ok(r) => {
                     debug!(
@@ -503,6 +527,18 @@ impl Resolver {
             }
         }
 
+        // Graceful degradation: return fallback 200 even if content-type didn't match.
+        if let Some(r) = fallback {
+            info!(
+                event = "fanout",
+                image,
+                reference,
+                project = r.project,
+                result = "fallback",
+                "returning fallback (no content-type match)"
+            );
+            return Ok(r);
+        }
         if let Some(e) = last_err {
             bail!("all projects failed, last error: {}", e);
         }
@@ -572,6 +608,142 @@ impl Resolver {
             body,
         })
     }
+
+    // ─── tag list resolution ─────────────────────────────────────────────────
+
+    /// Resolves a tag list for an image across discovered projects.
+    /// Uses cache to remember which project owns the image. No singleflight
+    /// needed — tag list requests are not concurrent-hot.
+    pub async fn resolve_tags(
+        &self,
+        image: &str,
+        auth: Option<&str>,
+    ) -> Result<Arc<ResolveResult>> {
+        let cache_key = format!("tags:{}", image);
+
+        // Fast path: cache hit — we know which project has this image.
+        if let Some(project) = self.cache.get(&cache_key).await {
+            if discovery::is_safe_project_name(&project) {
+                match self.fetch_tags(&project, image, auth).await {
+                    Ok(r) if r.status == 200 => return Ok(Arc::new(r)),
+                    _ => {
+                        // Stale — evict and fall through to fan-out.
+                        self.cache.delete(&cache_key).await;
+                    }
+                }
+            }
+        }
+
+        // Cache miss: fan-out to all projects.
+        let all_projects = self.discovery.get_projects();
+        if all_projects.is_empty() {
+            bail!("no proxy-cache projects discovered");
+        }
+
+        let projects: &[String] = if all_projects.len() > self.max_fanout {
+            &all_projects[..self.max_fanout]
+        } else {
+            &all_projects
+        };
+
+        let timeout = self.timeout;
+        let auth_owned = auth.map(str::to_string);
+        let image_owned = image.to_string();
+
+        let futures: Vec<_> = projects
+            .iter()
+            .filter(|proj| discovery::is_safe_project_name(proj))
+            .map(|proj| {
+                let proj = proj.clone();
+                let image = image_owned.clone();
+                let auth = auth_owned.clone();
+                let resolver = self.clone();
+                async move {
+                    tokio::time::timeout(
+                        timeout,
+                        resolver.fetch_tags(&proj, &image, auth.as_deref()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("timeout probing {}", proj)))
+                }
+            })
+            .collect();
+
+        if futures.is_empty() {
+            bail!("no available proxy-cache projects");
+        }
+
+        let count = futures.len();
+        let mut results = stream::iter(futures).buffer_unordered(count);
+        let mut last_err: Option<anyhow::Error> = None;
+
+        while let Some(res) = results.next().await {
+            match res {
+                Ok(r) if r.status == 200 => {
+                    // Cache the project mapping.
+                    self.cache
+                        .set_with_ttl(cache_key, r.project.clone(), self.cache_ttl)
+                        .await;
+                    return Ok(Arc::new(r));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        if let Some(e) = last_err {
+            bail!("all projects failed for tags, last error: {}", e);
+        }
+        bail!(
+            "tags for image {} not found in any proxy-cache project",
+            image
+        );
+    }
+
+    /// Fetches the tag list for an image from a specific project.
+    async fn fetch_tags(
+        &self,
+        project: &str,
+        image: &str,
+        auth: Option<&str>,
+    ) -> Result<ResolveResult> {
+        if !discovery::is_safe_project_name(project) {
+            bail!(
+                "refusing unsafe project name in URL construction: {}",
+                project
+            );
+        }
+        let url = format!(
+            "{}/v2/{}/{}/tags/list",
+            self.harbor_url, project, image
+        );
+
+        let mut req = self.client.get(&url);
+        if let Some(a) = auth {
+            req = req.header("Authorization", a);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow!("request to {}: {}", project, e))?;
+
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("read body from {}: {}", project, e))?;
+
+        Ok(ResolveResult {
+            project: project.to_string(),
+            status,
+            headers,
+            body,
+        })
+    }
 }
 
 /// Buckets an HTTP status code into a class label for Prometheus metrics.
@@ -630,6 +802,38 @@ fn decode_cache_value(value: &str) -> (&str, Option<u64>) {
     }
 
     (value, None)
+}
+
+/// Checks if a response Content-Type matches any of the client's Accept values.
+/// Strips parameters (after `;`) and compares media type only.
+/// Supports `*/*` (matches everything) and `application/*` (matches any `application/` type).
+#[inline]
+fn content_type_matches(response_ct: &str, accept_values: &[String]) -> bool {
+    if accept_values.is_empty() {
+        return false;
+    }
+    // Strip parameters after `;` from response Content-Type
+    let ct = response_ct.split(';').next().unwrap_or("").trim();
+    for accept in accept_values {
+        // Strip parameters after `;` from Accept value
+        let av = accept.split(';').next().unwrap_or("").trim();
+        if av == "*/*" {
+            return true;
+        }
+        // Handle type/* wildcards (e.g. application/*)
+        if let Some(prefix) = av.strip_suffix("/*") {
+            if let Some(ct_type) = ct.split('/').next() {
+                if ct_type == prefix {
+                    return true;
+                }
+            }
+        }
+        // Exact media type match
+        if ct.eq_ignore_ascii_case(av) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1282,5 +1486,300 @@ mod tests {
         let (legacy, legacy_ts) = decode_cache_value("legacy-project");
         assert_eq!(legacy, "legacy-project");
         assert_eq!(legacy_ts, None);
+    }
+
+    #[test]
+    fn test_content_type_matches() {
+        let docker_ct = "application/vnd.docker.distribution.manifest.v2+json";
+        let oci_ct = "application/vnd.oci.image.manifest.v1+json";
+
+        // Exact match
+        let accept = vec![docker_ct.to_string()];
+        assert!(content_type_matches(docker_ct, &accept), "exact match should succeed");
+
+        // No match
+        assert!(!content_type_matches(oci_ct, &accept), "different type should not match");
+
+        // Wildcard */*
+        let accept_wildcard = vec!["*/*".to_string()];
+        assert!(content_type_matches(docker_ct, &accept_wildcard), "*/* should match anything");
+        assert!(content_type_matches(oci_ct, &accept_wildcard), "*/* should match anything");
+
+        // application/* wildcard
+        let accept_app_wildcard = vec!["application/*".to_string()];
+        assert!(content_type_matches(docker_ct, &accept_app_wildcard), "application/* should match application types");
+        assert!(content_type_matches(oci_ct, &accept_app_wildcard), "application/* should match application types");
+        assert!(!content_type_matches("text/plain", &accept_app_wildcard), "application/* should not match text/plain");
+
+        // Content-Type with parameters (strip after ;)
+        let ct_with_params = "application/vnd.docker.distribution.manifest.v2+json; charset=utf-8";
+        assert!(content_type_matches(ct_with_params, &accept), "should strip params after ;");
+
+        // Accept with parameters (strip after ;)
+        let accept_with_params = vec!["application/vnd.docker.distribution.manifest.v2+json; q=0.9".to_string()];
+        assert!(content_type_matches(docker_ct, &accept_with_params), "should strip accept params after ;");
+
+        // Empty accept list — no match
+        assert!(!content_type_matches(docker_ct, &[]), "empty accept should not match");
+
+        // Multiple accept values — match if any matches
+        let accept_multi = vec![oci_ct.to_string(), docker_ct.to_string()];
+        assert!(content_type_matches(docker_ct, &accept_multi), "should match any in list");
+        assert!(content_type_matches(oci_ct, &accept_multi), "should match any in list");
+    }
+
+    #[tokio::test]
+    async fn test_content_type_negotiation_picks_best_match() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2.0/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                    {"name":"dockerhub","registry_id":1},
+                    {"name":"ghcr","registry_id":2}
+                ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        // dockerhub returns OCI format
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"schemaVersion": 2}"#, "application/vnd.oci.image.manifest.v1+json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // ghcr returns Docker format (with slight delay to ensure it arrives second)
+        Mock::given(method("GET"))
+            .and(path("/v2/ghcr/nginx/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"schemaVersion": 2}"#, "application/vnd.docker.distribution.manifest.v2+json")
+                    .set_delay(Duration::from_millis(50)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let discoverer = resolver.discovery.clone();
+        let discovery_task = tokio::spawn(async move {
+            discoverer.start(Duration::from_secs(60), shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !resolver.get_discovered_projects().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery should populate projects");
+
+        // Client prefers Docker format
+        let accept = vec![
+            "application/vnd.docker.distribution.manifest.v2+json".to_string(),
+        ];
+        let result = resolver
+            .resolve_manifest("nginx", "latest", None, &accept)
+            .await
+            .expect("should resolve manifest");
+
+        // Should pick ghcr (Docker format) even though dockerhub (OCI) responded first
+        assert_eq!(result.project, "ghcr", "should select project matching Accept header");
+
+        discovery_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_content_type_fallback_on_no_match() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2.0/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                    {"name":"dockerhub","registry_id":1},
+                    {"name":"ghcr","registry_id":2}
+                ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        // Both projects return 200 but with content types that don't match Accept
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"schemaVersion": 2}"#, "application/vnd.oci.image.manifest.v1+json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/ghcr/nginx/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"schemaVersion": 2}"#, "application/vnd.oci.image.manifest.v1+json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let discoverer = resolver.discovery.clone();
+        let discovery_task = tokio::spawn(async move {
+            discoverer.start(Duration::from_secs(60), shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !resolver.get_discovered_projects().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery should populate projects");
+
+        // Client wants a type that no project returns
+        let accept = vec![
+            "application/vnd.docker.distribution.manifest.list.v2+json".to_string(),
+        ];
+        let result = resolver
+            .resolve_manifest("nginx", "latest", None, &accept)
+            .await
+            .expect("should return fallback even when no content-type matches");
+
+        // Should still get a valid 200 response (graceful degradation)
+        assert_eq!(result.status, 200, "fallback should return 200");
+        assert!(!result.body.is_empty(), "fallback should have a body");
+
+        discovery_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_handle_tags_returns_tag_list() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/tags/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"name":"nginx","tags":["latest","1.25","alpine"]}"#)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        let result = resolver
+            .fetch_tags("dockerhub", "nginx", None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, 200);
+        assert_eq!(result.project, "dockerhub");
+        let body_str = String::from_utf8_lossy(&result.body);
+        assert!(body_str.contains("latest"));
+        assert!(body_str.contains("1.25"));
+        assert!(body_str.contains("alpine"));
+    }
+
+    #[tokio::test]
+    async fn test_tags_cached() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2.0/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                    {"name":"dockerhub","registry_id":1},
+                    {"name":"ghcr","registry_id":2}
+                ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/tags/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"name":"nginx","tags":["latest"]}"#)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/ghcr/nginx/tags/list"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let discoverer = resolver.discovery.clone();
+        let discovery_task = tokio::spawn(async move {
+            discoverer.start(Duration::from_secs(60), shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !resolver.get_discovered_projects().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery should populate projects");
+
+        // First call: fan-out to all projects
+        let result1 = resolver.resolve_tags("nginx", None).await.unwrap();
+        assert_eq!(result1.status, 200);
+        assert_eq!(result1.project, "dockerhub");
+
+        // Verify cache is populated
+        let cached = resolver.cache.get(&"tags:nginx".to_string()).await;
+        assert!(cached.is_some(), "tags cache should be populated");
+        assert_eq!(cached.unwrap(), "dockerhub");
+
+        // Second call: should use cache (direct fetch from known project)
+        let result2 = resolver.resolve_tags("nginx", None).await.unwrap();
+        assert_eq!(result2.status, 200);
+        assert_eq!(result2.project, "dockerhub");
+
+        // Count total upstream /v2/ tag requests — second call should not fan out
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should report requests");
+        let tag_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path().contains("/tags/list"))
+            .collect();
+
+        // Fan-out hit both projects (2) + cache-hit fetch from dockerhub (1) = 3
+        assert_eq!(
+            tag_requests.len(),
+            3,
+            "expected 2 fan-out + 1 cache-hit fetch, got {}: {:?}",
+            tag_requests.len(),
+            tag_requests.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+        );
+
+        discovery_task.abort();
     }
 }

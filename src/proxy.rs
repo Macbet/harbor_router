@@ -134,6 +134,9 @@ pub async fn registry_handler(
         Ok((image, PathKind::Blobs, digest)) => {
             handle_blob(&state, image, digest, auth_header).await
         }
+        Ok((image, PathKind::Tags, _)) => {
+            handle_tags(&state, image, auth_header.as_deref()).await
+        }
     }
 }
 
@@ -186,6 +189,47 @@ async fn handle_manifest(
             // Track image popularity for metrics
             metrics::global().record_manifest_request(image, reference);
 
+            build_response(r.status, &r.headers, r.body.clone())
+        }
+    }
+}
+
+// ─── tags ────────────────────────────────────────────────────────────────────
+
+async fn handle_tags(
+    state: &AppState,
+    image: &str,
+    auth: Option<&str>,
+) -> Response {
+    let start = Instant::now();
+    let result = state.resolver.resolve_tags(image, auth).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Err(e) => {
+            error!(
+                event = "tags_resolve",
+                image,
+                duration_ms,
+                error = %e,
+                result = "error",
+                "tags resolve failed"
+            );
+            error_response(
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN",
+                "requested tag list not found",
+            )
+        }
+        Ok(r) => {
+            info!(
+                event = "tags_resolve",
+                image,
+                project = r.project,
+                duration_ms,
+                result = "ok",
+                "tags resolved"
+            );
             build_response(r.status, &r.headers, r.body.clone())
         }
     }
@@ -399,7 +443,9 @@ pub async fn logging_middleware(req: Request, next: Next) -> Response {
     let duration_ms = start.elapsed().as_millis() as u64;
 
     // Determine request type without allocation using static strings
-    let req_type = if path.contains("/manifests/") {
+    let req_type = if path.contains("/tags/list") {
+        "tags"
+    } else if path.contains("/manifests/") {
         "manifest"
     } else if path.contains("/blobs/") {
         "blob"
@@ -477,6 +523,7 @@ pub async fn logging_middleware(req: Request, next: Next) -> Response {
 enum PathKind {
     Manifests,
     Blobs,
+    Tags,
 }
 
 /// Validates that an image name is safe for URL construction.
@@ -510,7 +557,18 @@ fn is_safe_reference(reference: &str) -> bool {
 /// `(image, kind, reference)` without unnecessary allocations.
 #[inline]
 fn parse_path(path: &str) -> anyhow::Result<(&str, PathKind, &str)> {
-    // Try manifests first (more common)
+    // Try tags/list first (must be checked before manifests/blobs)
+    if let Some(image) = path.strip_suffix("/tags/list") {
+        if image.is_empty() {
+            anyhow::bail!("invalid path: missing image name");
+        }
+        if !is_safe_image_name(image) {
+            anyhow::bail!("invalid image name: unsafe characters or path traversal");
+        }
+        return Ok((image, PathKind::Tags, "list"));
+    }
+
+    // Try manifests (more common)
     if let Some(idx) = path.rfind("/manifests/") {
         let image = &path[..idx];
         let reference = &path[idx + 11..]; // "/manifests/".len() == 11
@@ -541,7 +599,7 @@ fn parse_path(path: &str) -> anyhow::Result<(&str, PathKind, &str)> {
         return Ok((image, PathKind::Blobs, reference));
     }
 
-    anyhow::bail!("path must contain /manifests/ or /blobs/")
+    anyhow::bail!("path must contain /manifests/, /blobs/, or /tags/list")
 }
 
 /// Allowlist of response headers to forward from upstream Harbor.
@@ -677,13 +735,50 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_path_missing_manifests_or_blobs() {
-        let result = parse_path("nginx/tags/list");
+    fn test_parse_path_missing_kind() {
+        let result = parse_path("nginx/other/endpoint");
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("/manifests/ or /blobs/"));
+            .contains("path must contain"));
+    }
+
+    #[test]
+    fn test_parse_path_tags() {
+        let (image, kind, reference) = parse_path("nginx/tags/list").unwrap();
+        assert_eq!(image, "nginx");
+        assert_eq!(kind, PathKind::Tags);
+        assert_eq!(reference, "list");
+    }
+
+    #[test]
+    fn test_parse_path_tags_nested_image() {
+        let (image, kind, reference) = parse_path("grafana/grafana/tags/list").unwrap();
+        assert_eq!(image, "grafana/grafana");
+        assert_eq!(kind, PathKind::Tags);
+        assert_eq!(reference, "list");
+    }
+
+    #[test]
+    fn test_parse_path_tags_deeply_nested() {
+        let (image, kind, reference) = parse_path("library/redis/alpine/tags/list").unwrap();
+        assert_eq!(image, "library/redis/alpine");
+        assert_eq!(kind, PathKind::Tags);
+        assert_eq!(reference, "list");
+    }
+
+    #[test]
+    fn test_parse_path_tags_rejects_traversal() {
+        let result = parse_path("../admin/nginx/tags/list");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn test_parse_path_tags_empty_image() {
+        let result = parse_path("/tags/list");
+        assert!(result.is_err());
     }
 
     #[test]
