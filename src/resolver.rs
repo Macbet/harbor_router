@@ -66,7 +66,7 @@ impl Resolver {
         idle_conn_timeout: Duration,
         http2_prior_knowledge: bool,
         max_fanout: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         // Build an optimized HTTP client for upstream Harbor requests.
         // For 500k RPS, connection reuse is critical.
         let mut builder = reqwest::Client::builder()
@@ -89,9 +89,9 @@ impl Resolver {
             builder = builder.http2_prior_knowledge();
         }
 
-        let client = builder.build().expect("build resolver http client");
+        let client = builder.build()?;
 
-        Self {
+        Ok(Self {
             discovery,
             cache,
             client,
@@ -99,7 +99,7 @@ impl Resolver {
             timeout,
             flights: Arc::new(DashMap::with_capacity(10_000)), // Pre-allocate for performance
             max_fanout,
-        }
+        })
     }
 
     /// Resolves a manifest, using cache and singleflight deduplication.
@@ -248,8 +248,10 @@ impl Resolver {
                 }
             }
             // Not yet — wait for the leader to finish.
-            rx.changed()
+            let follower_timeout = self.timeout + Duration::from_secs(5);
+            tokio::time::timeout(follower_timeout, rx.changed())
                 .await
+                .map_err(|_| anyhow!("singleflight: follower timed out waiting for leader"))?
                 .map_err(|_| anyhow!("singleflight: leader dropped channel"))?;
             let result = rx.borrow().clone();
             return result
@@ -460,7 +462,7 @@ mod tests {
     use crate::cache::MokaCache;
     use crate::discovery::Discoverer;
     use secrecy::SecretString;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -471,7 +473,8 @@ mod tests {
             SecretString::from("user".to_string()),
             SecretString::from("pass".to_string()),
             None,
-        );
+        )
+        .unwrap();
         let cache = MokaCache::build(Duration::from_secs(60));
 
         // Build a client that can handle plain HTTP (wiremock doesn't use TLS)
@@ -639,5 +642,81 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, 200);
+    }
+
+    #[tokio::test]
+    async fn test_singleflight_follower_timeout() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2.0/projects"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"name":"dockerhub","registry_id":1}]"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"schemaVersion": 2}"#)
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut resolver = setup_test_resolver(&mock_server.uri());
+        resolver.timeout = Duration::from_millis(100);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let discoverer = resolver.discovery.clone();
+        let discovery_task = tokio::spawn(async move {
+            discoverer.start(Duration::from_secs(60), shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !resolver.get_discovered_projects().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery should populate projects");
+
+        let accept = vec!["application/vnd.docker.distribution.manifest.v2+json".to_string()];
+        let (leader_result, follower_result) = tokio::join!(
+            resolver.resolve_manifest("nginx", "latest", None, &accept),
+            resolver.resolve_manifest("nginx", "latest", None, &accept)
+        );
+
+        assert!(leader_result.is_err());
+        assert!(follower_result.is_err());
+
+        discovery_task.abort();
+
+        let key = "nginx:latest".to_string();
+        resolver.flights.remove(&key);
+        let (tx, _rx) = watch::channel(None);
+        resolver
+            .flights
+            .insert(key.clone(), Arc::new(Flight { tx }));
+
+        let start = Instant::now();
+        let timeout_result = resolver
+            .singleflight(key, "nginx", "latest", None, &accept)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(timeout_result.is_err());
+        let error = timeout_result
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("singleflight: follower timed out waiting for leader"));
+        assert!(elapsed >= Duration::from_secs(5));
     }
 }

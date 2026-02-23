@@ -65,13 +65,12 @@ impl Discoverer {
         username: SecretString,
         password: SecretString,
         cache: Option<cache::Cache>,
-    ) -> Self {
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
-            .build()
-            .expect("build discovery http client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             inner: Arc::new(Inner {
                 harbor_url: harbor_url.to_string(),
                 username,
@@ -80,7 +79,7 @@ impl Discoverer {
                 projects: ArcSwap::from_pointee(Vec::new()),
                 cache,
             }),
-        }
+        })
     }
 
     /// Returns the current list of discovered proxy-cache project names.
@@ -91,15 +90,23 @@ impl Discoverer {
 
     /// Runs the background discovery loop. Seeds from cache first (instant warm start),
     /// then performs an initial API fetch, and re-discovers at `interval`.
-    pub async fn start(&self, interval: Duration) {
+    pub async fn start(
+        &self,
+        interval: Duration,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
         self.seed_from_cache().await;
         self.refresh().await;
-
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // consume the immediate first tick
         loop {
-            ticker.tick().await;
-            self.refresh().await;
+            tokio::select! {
+                _ = ticker.tick() => self.refresh().await,
+                _ = shutdown_rx.changed() => {
+                    info!(event = "discovery", "shutting down gracefully");
+                    break;
+                }
+            }
         }
     }
 

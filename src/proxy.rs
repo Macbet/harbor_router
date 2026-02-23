@@ -1,4 +1,5 @@
 use crate::{discovery, metrics, resolver::Resolver};
+use anyhow::Result;
 
 /// RAII guard that decrements the in-flight counter when dropped.
 struct InflightGuard;
@@ -39,7 +40,8 @@ impl AppState {
         harbor_url: String,
         proxy_project: String,
         http2_prior_knowledge: bool,
-    ) -> Arc<Self> {
+        blob_read_timeout: Duration,
+    ) -> Result<Arc<Self>> {
         // Build an optimized HTTP client for blob streaming.
         // High connection pool limits for sustained 500k RPS throughput.
         let mut builder = reqwest::Client::builder()
@@ -50,6 +52,7 @@ impl AppState {
             .tcp_keepalive(Duration::from_secs(30))
             .tcp_nodelay(true) // Disable Nagle's algorithm
             .connect_timeout(Duration::from_secs(5))
+            .read_timeout(blob_read_timeout)
             // Do not follow redirects; we want to stream directly from Harbor storage.
             .redirect(reqwest::redirect::Policy::none());
 
@@ -59,14 +62,14 @@ impl AppState {
             builder = builder.http2_prior_knowledge();
         }
 
-        let blob_client = builder.build().expect("build blob http client");
+        let blob_client = builder.build()?;
 
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             resolver,
             harbor_url: Arc::new(harbor_url),
             proxy_project: Arc::new(proxy_project),
             blob_client,
-        })
+        }))
     }
 }
 
@@ -541,15 +544,34 @@ fn parse_path(path: &str) -> anyhow::Result<(&str, PathKind, &str)> {
     anyhow::bail!("path must contain /manifests/ or /blobs/")
 }
 
+/// Allowlist of response headers to forward from upstream Harbor.
+/// Only these headers pass through — prevents leaking internal headers (Set-Cookie, X-* etc).
+const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "docker-content-digest",
+    "docker-distribution-api-version",
+    "etag",
+    "accept-ranges",
+    "content-range",
+    "location",
+    "cache-control",
+    "x-content-type-options",
+    "www-authenticate",
+];
+
 #[inline]
 fn copy_headers(src: &reqwest::header::HeaderMap, dst: &mut HeaderMap) {
     dst.reserve(src.len());
     for (name, value) in src {
-        if let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(name.as_str().as_bytes()),
-            HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            dst.insert(n, v);
+        let name_lower = name.as_str();
+        if ALLOWED_RESPONSE_HEADERS.contains(&name_lower) {
+            if let (Ok(n), Ok(v)) = (
+                HeaderName::from_bytes(name.as_str().as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                dst.insert(n, v);
+            }
         }
     }
 }
@@ -816,5 +838,33 @@ mod tests {
         assert!(!is_safe_reference("foo\\bar"));
         assert!(!is_safe_reference("foo\x00bar"));
         assert!(!is_safe_reference(" spaces "));
+    }
+
+    #[test]
+    fn test_copy_headers_filters_unsafe() {
+        let mut src = reqwest::header::HeaderMap::new();
+        src.insert("content-type", "application/json".parse().unwrap());
+        src.insert("docker-content-digest", "sha256:abc123".parse().unwrap());
+        src.insert("set-cookie", "sid=secret; HttpOnly".parse().unwrap());
+        src.insert("x-custom-evil", "leak".parse().unwrap());
+
+        let mut dst = HeaderMap::new();
+        copy_headers(&src, &mut dst);
+
+        assert_eq!(dst.get("content-type").unwrap(), "application/json");
+        assert_eq!(dst.get("docker-content-digest").unwrap(), "sha256:abc123");
+        assert!(!dst.contains_key("set-cookie"));
+        assert!(!dst.contains_key("x-custom-evil"));
+    }
+
+    #[test]
+    fn test_copy_headers_allows_location() {
+        let mut src = reqwest::header::HeaderMap::new();
+        src.insert("location", "https://storage.example/blob".parse().unwrap());
+
+        let mut dst = HeaderMap::new();
+        copy_headers(&src, &mut dst);
+
+        assert_eq!(dst.get("location").unwrap(), "https://storage.example/blob");
     }
 }
