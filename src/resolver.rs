@@ -1,4 +1,4 @@
-use crate::{cache, discovery, discovery::Discoverer, metrics};
+use crate::{cache, circuit_breaker::CircuitBreaker, discovery, discovery::Discoverer, metrics};
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -6,10 +6,12 @@ use futures::stream::{self, StreamExt};
 use http::HeaderMap;
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
 use tracing::{debug, info};
+
+const NEGATIVE_CACHE_SENTINEL: &str = "__NEGATIVE__";
 
 /// Outcome of a successful manifest lookup against a specific project.
 #[derive(Clone)]
@@ -53,6 +55,10 @@ pub struct Resolver {
     flights: Flights,
     /// Maximum number of projects to fan out to (DoS protection).
     max_fanout: usize,
+    negative_cache_ttl: Duration,
+    cache_ttl: Duration,
+    stale_while_revalidate: Duration,
+    circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl Resolver {
@@ -62,10 +68,14 @@ impl Resolver {
         cache: cache::Cache,
         harbor_url: &str,
         timeout: Duration,
+        negative_cache_ttl: Duration,
+        cache_ttl: Duration,
+        stale_while_revalidate: Duration,
         max_idle_conns_per_host: usize,
         idle_conn_timeout: Duration,
         http2_prior_knowledge: bool,
         max_fanout: usize,
+        circuit_breaker: Arc<CircuitBreaker>,
     ) -> Result<Self> {
         // Build an optimized HTTP client for upstream Harbor requests.
         // For 500k RPS, connection reuse is critical.
@@ -99,6 +109,10 @@ impl Resolver {
             timeout,
             flights: Arc::new(DashMap::with_capacity(10_000)), // Pre-allocate for performance
             max_fanout,
+            negative_cache_ttl,
+            cache_ttl,
+            stale_while_revalidate,
+            circuit_breaker,
         })
     }
 
@@ -115,11 +129,16 @@ impl Resolver {
         let start = Instant::now();
 
         // Fast path: cache hit.
-        if let Some(project) = self.cache.get(&cache_key).await {
+        if let Some(cached_value) = self.cache.get(&cache_key).await {
             metrics::global()
                 .cache_lookups_total
                 .with_label_values(&["hit"])
                 .inc();
+            let (project, timestamp) = if self.stale_while_revalidate.is_zero() {
+                (cached_value.as_str(), None)
+            } else {
+                decode_cache_value(&cached_value)
+            };
             debug!(
                 event = "cache",
                 image,
@@ -129,11 +148,71 @@ impl Resolver {
                 "cache hit"
             );
 
+            if project == NEGATIVE_CACHE_SENTINEL {
+                bail!(
+                    "image {}:{} not found in any proxy-cache project",
+                    image,
+                    reference
+                );
+            }
+
+            let now_epoch = now_epoch_secs();
+            let is_stale = !self.stale_while_revalidate.is_zero()
+                && timestamp
+                    .map(|ts| now_epoch.saturating_sub(ts) > self.cache_ttl.as_secs())
+                    .unwrap_or(false);
+
             match self
-                .fetch_manifest(&project, image, reference, auth, accept)
+                .fetch_manifest(project, image, reference, auth, accept)
                 .await
             {
                 Ok(r) if r.status == 200 => {
+                    if is_stale {
+                        let resolver = self.clone();
+                        let image_owned = image.to_string();
+                        let reference_owned = reference.to_string();
+                        let auth_owned = auth.map(str::to_string);
+                        let accept_owned = accept.to_vec();
+                        let cache_key_owned = cache_key.clone();
+                        tokio::spawn(async move {
+                            match resolver
+                                .parallel_lookup(
+                                    &image_owned,
+                                    &reference_owned,
+                                    auth_owned.as_deref(),
+                                    &accept_owned,
+                                )
+                                .await
+                            {
+                                Ok(refresh) => {
+                                    let refresh_project = refresh.project.clone();
+                                    let refresh_value =
+                                        encode_cache_value(&refresh_project, now_epoch_secs());
+                                    resolver
+                                        .cache
+                                        .set_with_ttl(
+                                            cache_key_owned,
+                                            refresh_value,
+                                            resolver.cache_ttl + resolver.stale_while_revalidate,
+                                        )
+                                        .await;
+                                    resolver
+                                        .cache
+                                        .set(format!("img:{}", image_owned), refresh_project)
+                                        .await;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        image = %image_owned,
+                                        reference = %reference_owned,
+                                        error = %error,
+                                        "stale cache background refresh failed"
+                                    );
+                                }
+                            }
+                        });
+                    }
+
                     metrics::global()
                         .resolve_duration
                         .with_label_values(&["hit"])
@@ -172,7 +251,18 @@ impl Resolver {
                     .with_label_values(&["miss"])
                     .observe(elapsed);
                 // Populate cache.
-                self.cache.set(cache_key, r.project.clone()).await;
+                if self.stale_while_revalidate.is_zero() {
+                    self.cache.set(cache_key, r.project.clone()).await;
+                } else {
+                    let encoded = encode_cache_value(&r.project, now_epoch_secs());
+                    self.cache
+                        .set_with_ttl(
+                            cache_key,
+                            encoded,
+                            self.cache_ttl + self.stale_while_revalidate,
+                        )
+                        .await;
+                }
                 self.cache
                     .set(format!("img:{}", image), r.project.clone())
                     .await;
@@ -182,6 +272,17 @@ impl Resolver {
                     .resolve_duration
                     .with_label_values(&["error"])
                     .observe(elapsed);
+                if let Err(e) = &result {
+                    if is_all_projects_non_200(e) {
+                        self.cache
+                            .set_with_ttl(
+                                cache_key,
+                                NEGATIVE_CACHE_SENTINEL.to_string(),
+                                self.negative_cache_ttl,
+                            )
+                            .await;
+                    }
+                }
             }
         }
         result
@@ -191,8 +292,9 @@ impl Resolver {
     #[inline]
     pub async fn cached_project(&self, image: &str, reference: &str) -> Option<String> {
         let key = format!("{}:{}", image, reference);
-        if let Some(p) = self.cache.get(&key).await {
-            return Some(p);
+        if let Some(cached_value) = self.cache.get(&key).await {
+            let (project, _) = decode_cache_value(&cached_value);
+            return Some(project.to_string());
         }
         self.cache.get(&format!("img:{}", image)).await
     }
@@ -320,6 +422,7 @@ impl Resolver {
 
         let futures: Vec<_> = projects
             .iter()
+            .filter(|project| self.circuit_breaker.is_available(project))
             .map(|proj| {
                 let proj = proj.clone();
                 let image = image_owned.clone();
@@ -328,7 +431,7 @@ impl Resolver {
                 let accept = Arc::clone(&accept_owned);
                 let resolver = self.clone();
                 async move {
-                    tokio::time::timeout(
+                    let result = tokio::time::timeout(
                         timeout,
                         resolver.fetch_manifest(
                             &proj,
@@ -339,10 +442,32 @@ impl Resolver {
                         ),
                     )
                     .await
-                    .unwrap_or_else(|_| Err(anyhow!("timeout probing {}", proj)))
+                    .unwrap_or_else(|_| Err(anyhow!("timeout probing {}", proj)));
+
+                    match &result {
+                        Ok(response) if response.status == 200 => {
+                            resolver.circuit_breaker.record_success(&proj);
+                        }
+                        Ok(response) => {
+                            if !is_client_error_status(response.status) {
+                                resolver.circuit_breaker.record_failure(&proj);
+                            }
+                        }
+                        Err(error) => {
+                            if should_record_transport_failure(error) {
+                                resolver.circuit_breaker.record_failure(&proj);
+                            }
+                        }
+                    }
+
+                    result
                 }
             })
             .collect();
+
+        if futures.is_empty() {
+            bail!("no available proxy-cache projects (all circuits open)");
+        }
 
         // Use FuturesUnordered via buffer_unordered to return as soon as the
         // first 200 response arrives, cancelling remaining futures.
@@ -418,6 +543,7 @@ impl Resolver {
             req = req.header("Accept", a.as_str());
         }
 
+        let start = std::time::Instant::now();
         let resp = req
             .send()
             .await
@@ -434,6 +560,10 @@ impl Resolver {
             .bytes()
             .await
             .map_err(|e| anyhow!("read body from {}: {}", project, e))?;
+        metrics::global()
+            .upstream_project_duration
+            .with_label_values(&[project])
+            .observe(start.elapsed().as_secs_f64());
 
         Ok(ResolveResult {
             project: project.to_string(),
@@ -454,6 +584,52 @@ fn status_class(code: u16) -> &'static str {
         400..=499 => "4xx",
         _ => "5xx",
     }
+}
+
+#[inline]
+fn is_client_error_status(status: u16) -> bool {
+    (400..500).contains(&status)
+}
+
+#[inline]
+fn should_record_transport_failure(error: &anyhow::Error) -> bool {
+    let msg = error.to_string();
+    !(msg.contains("builder error")
+        || msg.contains("invalid URL")
+        || msg.contains("relative URL without a base"))
+}
+
+#[inline]
+fn is_all_projects_non_200(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("not found in any proxy-cache project")
+}
+
+#[inline]
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+#[inline]
+fn encode_cache_value(project: &str, timestamp: u64) -> String {
+    format!("{}|{}", project, timestamp)
+}
+
+#[inline]
+fn decode_cache_value(value: &str) -> (&str, Option<u64>) {
+    if value == NEGATIVE_CACHE_SENTINEL {
+        return (NEGATIVE_CACHE_SENTINEL, None);
+    }
+
+    if let Some((project, timestamp)) = value.split_once('|') {
+        if let Ok(parsed_timestamp) = timestamp.parse::<u64>() {
+            return (project, Some(parsed_timestamp));
+        }
+    }
+
+    (value, None)
 }
 
 #[cfg(test)]
@@ -494,6 +670,10 @@ mod tests {
             timeout: Duration::from_secs(5),
             flights: Arc::new(DashMap::new()),
             max_fanout: 50,
+            negative_cache_ttl: Duration::from_millis(200),
+            cache_ttl: Duration::from_secs(60),
+            stale_while_revalidate: Duration::ZERO,
+            circuit_breaker: Arc::new(CircuitBreaker::new(5, 30)),
         }
     }
 
@@ -645,6 +825,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fetch_manifest_records_latency() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"schemaVersion": 2}"#)
+                    .insert_header(
+                        "content-type",
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        let result = resolver
+            .fetch_manifest("dockerhub", "nginx", "latest", None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, 200);
+        assert_eq!(result.project, "dockerhub");
+
+        let histogram = &metrics::global().upstream_project_duration;
+        let metric = histogram.with_label_values(&["dockerhub"]);
+        assert!(
+            metric.get_sample_count() > 0,
+            "Expected at least one observation in histogram for project 'dockerhub'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_negative_cache_prevents_fanout() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2.0/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                        {"name":"dockerhub","registry_id":1},
+                        {"name":"ghcr","registry_id":2}
+                    ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/ghcr/nginx/manifests/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let discoverer = resolver.discovery.clone();
+        let discovery_task = tokio::spawn(async move {
+            discoverer.start(Duration::from_secs(60), shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !resolver.get_discovered_projects().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery should populate projects");
+
+        let accept = vec!["application/vnd.docker.distribution.manifest.v2+json".to_string()];
+        assert!(resolver
+            .resolve_manifest("nginx", "missing", None, &accept)
+            .await
+            .is_err());
+
+        let first_requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should report requests");
+        let first_upstream_hits = first_requests
+            .iter()
+            .filter(|req| req.url.path().starts_with("/v2/"))
+            .count();
+        assert_eq!(first_upstream_hits, 2);
+
+        assert!(resolver
+            .resolve_manifest("nginx", "missing", None, &accept)
+            .await
+            .is_err());
+
+        let second_requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should report requests");
+        let second_upstream_hits = second_requests
+            .iter()
+            .filter(|req| req.url.path().starts_with("/v2/"))
+            .count();
+        assert_eq!(second_upstream_hits, first_upstream_hits);
+
+        discovery_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_negative_cache_expires() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2.0/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                        {"name":"dockerhub","registry_id":1},
+                        {"name":"ghcr","registry_id":2}
+                    ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/ghcr/nginx/manifests/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let discoverer = resolver.discovery.clone();
+        let discovery_task = tokio::spawn(async move {
+            discoverer.start(Duration::from_secs(60), shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !resolver.get_discovered_projects().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery should populate projects");
+
+        let accept = vec!["application/vnd.docker.distribution.manifest.v2+json".to_string()];
+        assert!(resolver
+            .resolve_manifest("nginx", "missing", None, &accept)
+            .await
+            .is_err());
+
+        let first_requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should report requests");
+        let first_upstream_hits = first_requests
+            .iter()
+            .filter(|req| req.url.path().starts_with("/v2/"))
+            .count();
+        assert_eq!(first_upstream_hits, 2);
+
+        assert!(resolver
+            .resolve_manifest("nginx", "missing", None, &accept)
+            .await
+            .is_err());
+
+        let second_requests_before_ttl = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should report requests");
+        let second_upstream_hits_before_ttl = second_requests_before_ttl
+            .iter()
+            .filter(|req| req.url.path().starts_with("/v2/"))
+            .count();
+        assert_eq!(second_upstream_hits_before_ttl, first_upstream_hits);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert!(resolver
+            .resolve_manifest("nginx", "missing", None, &accept)
+            .await
+            .is_err());
+
+        let third_requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should report requests");
+        let third_upstream_hits = third_requests
+            .iter()
+            .filter(|req| req.url.path().starts_with("/v2/"))
+            .count();
+        assert!(third_upstream_hits > second_upstream_hits_before_ttl);
+
+        discovery_task.abort();
+    }
+
+    #[tokio::test]
     async fn test_singleflight_follower_timeout() {
         let mock_server = MockServer::start().await;
 
@@ -718,5 +1110,177 @@ mod tests {
             .unwrap_or_default();
         assert!(error.contains("singleflight: follower timed out waiting for leader"));
         assert!(elapsed >= Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_stale_while_revalidate_serves_stale() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2.0/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                        {"name":"dockerhub","registry_id":1},
+                        {"name":"ghcr","registry_id":2}
+                    ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"schemaVersion":2}"#))
+            .mount(&mock_server)
+            .await;
+
+        let mut resolver = setup_test_resolver(&mock_server.uri());
+        resolver.cache_ttl = Duration::from_millis(100);
+        resolver.stale_while_revalidate = Duration::from_secs(2);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let discoverer = resolver.discovery.clone();
+        let discovery_task = tokio::spawn(async move {
+            discoverer.start(Duration::from_secs(60), shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !resolver.get_discovered_projects().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery should populate projects");
+
+        let stale_timestamp = now_epoch_secs().saturating_sub(1);
+        resolver
+            .cache
+            .set(
+                "nginx:latest".to_string(),
+                encode_cache_value("dockerhub", stale_timestamp),
+            )
+            .await;
+
+        let accept = vec!["application/vnd.docker.distribution.manifest.v2+json".to_string()];
+        let result = resolver
+            .resolve_manifest("nginx", "latest", None, &accept)
+            .await
+            .expect("stale cache should still be served");
+
+        assert_eq!(result.project, "dockerhub");
+        assert_eq!(result.status, 200);
+
+        discovery_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_stale_while_revalidate_triggers_background_refresh() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2.0/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                        {"name":"dockerhub","registry_id":1},
+                        {"name":"ghcr","registry_id":2}
+                    ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/staleproj/nginx/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"schemaVersion":2}"#))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/ghcr/nginx/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"schemaVersion":2}"#))
+            .mount(&mock_server)
+            .await;
+
+        let mut resolver = setup_test_resolver(&mock_server.uri());
+        resolver.cache_ttl = Duration::from_millis(100);
+        resolver.stale_while_revalidate = Duration::from_secs(2);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let discoverer = resolver.discovery.clone();
+        let discovery_task = tokio::spawn(async move {
+            discoverer.start(Duration::from_secs(60), shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !resolver.get_discovered_projects().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery should populate projects");
+
+        let stale_timestamp = now_epoch_secs().saturating_sub(1);
+        resolver
+            .cache
+            .set(
+                "nginx:latest".to_string(),
+                encode_cache_value("staleproj", stale_timestamp),
+            )
+            .await;
+
+        let accept = vec!["application/vnd.docker.distribution.manifest.v2+json".to_string()];
+        let result = resolver
+            .resolve_manifest("nginx", "latest", None, &accept)
+            .await
+            .expect("stale cache should still be served");
+        assert_eq!(result.project, "staleproj");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let requests = mock_server
+                    .received_requests()
+                    .await
+                    .expect("wiremock should report requests");
+                let has_refresh = requests
+                    .iter()
+                    .any(|req| req.url.path() == "/v2/ghcr/nginx/manifests/latest");
+                if has_refresh {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background refresh should hit discovered upstream");
+
+        discovery_task.abort();
+    }
+
+    #[test]
+    fn test_encode_decode_cache_value() {
+        let encoded = encode_cache_value("dockerhub", 1_700_000_000);
+        assert_eq!(encoded, "dockerhub|1700000000");
+
+        let (project, timestamp) = decode_cache_value(&encoded);
+        assert_eq!(project, "dockerhub");
+        assert_eq!(timestamp, Some(1_700_000_000));
+
+        let (negative, negative_ts) = decode_cache_value("__NEGATIVE__");
+        assert_eq!(negative, "__NEGATIVE__");
+        assert_eq!(negative_ts, None);
+
+        let (legacy, legacy_ts) = decode_cache_value("legacy-project");
+        assert_eq!(legacy, "legacy-project");
+        assert_eq!(legacy_ts, None);
     }
 }

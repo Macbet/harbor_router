@@ -1,7 +1,8 @@
 use dashmap::DashMap;
 use prometheus::{
     exponential_buckets, register_counter, register_counter_vec, register_gauge,
-    register_histogram_vec, Counter, CounterVec, Gauge, HistogramVec, TextEncoder,
+    register_gauge_vec, register_histogram_vec, Counter, CounterVec, Gauge, GaugeVec, HistogramVec,
+    TextEncoder,
 };
 use std::sync::{Arc, OnceLock};
 
@@ -34,8 +35,8 @@ pub struct Metrics {
     /// Blob proxy duration: result = "ok" | "error" | "fallback".
     pub blob_proxy_duration: HistogramVec,
     /// Upstream request duration by project: result = "ok" | "error".
-    #[allow(dead_code)] // Used in Task 7
     pub upstream_project_duration: HistogramVec,
+    pub circuit_breaker_state: GaugeVec,
 
     // ─── Image popularity tracking (lock-free) ────────────────────────────────
     /// Per-image manifest request counts.
@@ -118,6 +119,13 @@ pub fn global() -> &'static Metrics {
             exponential_buckets(0.005, 2.0, 14).expect("buckets")
         )
         .expect("register upstream_project_duration"),
+
+        circuit_breaker_state: register_gauge_vec!(
+            "harbor_router_circuit_breaker_state",
+            "Circuit breaker state by project: 0=closed, 1=open, 2=half-open.",
+            &["project"]
+        )
+        .expect("register circuit_breaker_state"),
 
         // Image popularity tracking
         image_manifest_requests: Arc::new(DashMap::with_capacity(MAX_TRACKED_IMAGES)),
@@ -347,6 +355,12 @@ mod tests {
                 exponential_buckets(0.005, 2.0, 14).unwrap()
             )
             .unwrap(),
+            circuit_breaker_state: register_gauge_vec!(
+                "test_manifest_circuit_breaker_state",
+                "test",
+                &["project"]
+            )
+            .unwrap(),
             image_manifest_requests: Arc::new(DashMap::new()),
             image_blob_requests: Arc::new(DashMap::new()),
             image_requests_total: register_counter_vec!(
@@ -421,6 +435,12 @@ mod tests {
                 "test",
                 &["project"],
                 exponential_buckets(0.005, 2.0, 14).unwrap()
+            )
+            .unwrap(),
+            circuit_breaker_state: register_gauge_vec!(
+                "test_histogram_circuit_breaker_state",
+                "test",
+                &["project"]
             )
             .unwrap(),
             image_manifest_requests: Arc::new(DashMap::new()),

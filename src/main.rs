@@ -1,4 +1,5 @@
 mod cache;
+mod circuit_breaker;
 mod config;
 mod discovery;
 mod metrics;
@@ -150,15 +151,23 @@ async fn async_main() -> Result<()> {
         secrecy::SecretString::from(cfg.harbor_password.expose_secret().to_string()),
         disc_cache,
     )?;
+    let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
+        cfg.circuit_breaker_threshold,
+        cfg.circuit_breaker_timeout.as_secs(),
+    ));
     let res = resolver::Resolver::new(
         disc.clone(),
         ttl_cache,
         &cfg.harbor_url,
         cfg.resolver_timeout,
+        cfg.negative_cache_ttl,
+        cfg.cache_ttl,
+        cfg.stale_while_revalidate,
         cfg.max_idle_conns_per_host,
         cfg.idle_conn_timeout,
         cfg.http2_prior_knowledge,
         cfg.max_fanout_projects,
+        circuit_breaker,
     )?;
     let app_state = proxy::AppState::new(
         res,
