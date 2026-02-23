@@ -630,7 +630,10 @@ impl Resolver {
         let max_attempts = self.retry_max_attempts.max(1);
 
         for attempt in 0..max_attempts {
-            match self.fetch_manifest(project, image, reference, auth, accept).await {
+            match self
+                .fetch_manifest(project, image, reference, auth, accept)
+                .await
+            {
                 Ok(result) if is_retryable_status(result.status) && attempt + 1 < max_attempts => {
                     let delay = self.retry_base_delay * 2u32.pow(attempt);
                     debug!(
