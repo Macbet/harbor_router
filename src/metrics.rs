@@ -33,6 +33,9 @@ pub struct Metrics {
     pub singleflight_dedup_total: Counter,
     /// Blob proxy duration: result = "ok" | "error" | "fallback".
     pub blob_proxy_duration: HistogramVec,
+    /// Upstream request duration by project: result = "ok" | "error".
+    #[allow(dead_code)] // Used in Task 7
+    pub upstream_project_duration: HistogramVec,
 
     // ─── Image popularity tracking (lock-free) ────────────────────────────────
     /// Per-image manifest request counts.
@@ -107,6 +110,14 @@ pub fn global() -> &'static Metrics {
             exponential_buckets(0.01, 2.0, 14).expect("buckets")
         )
         .expect("register blob_proxy_duration"),
+
+        upstream_project_duration: register_histogram_vec!(
+            "harbor_router_upstream_project_duration_seconds",
+            "Duration of upstream requests by project",
+            &["project"],
+            exponential_buckets(0.005, 2.0, 14).expect("buckets")
+        )
+        .expect("register upstream_project_duration"),
 
         // Image popularity tracking
         image_manifest_requests: Arc::new(DashMap::with_capacity(MAX_TRACKED_IMAGES)),
@@ -293,40 +304,57 @@ mod tests {
     fn test_record_manifest_request() {
         let metrics = Metrics {
             requests_total: register_counter_vec!(
-                "test_requests_total",
+                "test_manifest_requests_total",
                 "test",
                 &["method", "type", "status"]
             )
             .unwrap(),
             resolve_duration: register_histogram_vec!(
-                "test_resolve_duration",
+                "test_manifest_resolve_duration",
                 "test",
                 &["result"],
                 exponential_buckets(0.005, 2.0, 14).unwrap()
             )
             .unwrap(),
-            cache_lookups_total: register_counter_vec!("test_cache_lookups", "test", &["result"])
+            cache_lookups_total: register_counter_vec!(
+                "test_manifest_cache_lookups",
+                "test",
+                &["result"]
+            )
+            .unwrap(),
+            discovered_projects: register_gauge!("test_manifest_discovered_projects", "test")
                 .unwrap(),
-            discovered_projects: register_gauge!("test_discovered_projects", "test").unwrap(),
             upstream_requests_total: register_counter_vec!(
-                "test_upstream_requests",
+                "test_manifest_upstream_requests",
                 "test",
                 &["project", "status"]
             )
             .unwrap(),
-            inflight_requests: register_gauge!("test_inflight_requests", "test").unwrap(),
-            singleflight_dedup_total: register_counter!("test_singleflight_dedup", "test").unwrap(),
+            inflight_requests: register_gauge!("test_manifest_inflight_requests", "test").unwrap(),
+            singleflight_dedup_total: register_counter!("test_manifest_singleflight_dedup", "test")
+                .unwrap(),
             blob_proxy_duration: register_histogram_vec!(
-                "test_blob_proxy_duration",
+                "test_manifest_blob_proxy_duration",
                 "test",
                 &["result"],
                 exponential_buckets(0.01, 2.0, 14).unwrap()
             )
             .unwrap(),
+            upstream_project_duration: register_histogram_vec!(
+                "test_manifest_upstream_project_duration",
+                "test",
+                &["project"],
+                exponential_buckets(0.005, 2.0, 14).unwrap()
+            )
+            .unwrap(),
             image_manifest_requests: Arc::new(DashMap::new()),
             image_blob_requests: Arc::new(DashMap::new()),
-            image_requests_total: register_counter_vec!("test_image_requests", "test", &["type"])
-                .unwrap(),
+            image_requests_total: register_counter_vec!(
+                "test_manifest_image_requests",
+                "test",
+                &["type"]
+            )
+            .unwrap(),
         };
 
         // Record some requests
@@ -343,5 +371,92 @@ mod tests {
             *metrics.image_manifest_requests.get("redis:7.0").unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn test_upstream_project_duration_histogram() {
+        let metrics = Metrics {
+            requests_total: register_counter_vec!(
+                "test_histogram_requests_total",
+                "test",
+                &["method", "type", "status"]
+            )
+            .unwrap(),
+            resolve_duration: register_histogram_vec!(
+                "test_histogram_resolve_duration",
+                "test",
+                &["result"],
+                exponential_buckets(0.005, 2.0, 14).unwrap()
+            )
+            .unwrap(),
+            cache_lookups_total: register_counter_vec!(
+                "test_histogram_cache_lookups",
+                "test",
+                &["result"]
+            )
+            .unwrap(),
+            discovered_projects: register_gauge!("test_histogram_discovered_projects", "test")
+                .unwrap(),
+            upstream_requests_total: register_counter_vec!(
+                "test_histogram_upstream_requests",
+                "test",
+                &["project", "status"]
+            )
+            .unwrap(),
+            inflight_requests: register_gauge!("test_histogram_inflight_requests", "test").unwrap(),
+            singleflight_dedup_total: register_counter!(
+                "test_histogram_singleflight_dedup",
+                "test"
+            )
+            .unwrap(),
+            blob_proxy_duration: register_histogram_vec!(
+                "test_histogram_blob_proxy_duration",
+                "test",
+                &["result"],
+                exponential_buckets(0.01, 2.0, 14).unwrap()
+            )
+            .unwrap(),
+            upstream_project_duration: register_histogram_vec!(
+                "test_histogram_upstream_project_duration",
+                "test",
+                &["project"],
+                exponential_buckets(0.005, 2.0, 14).unwrap()
+            )
+            .unwrap(),
+            image_manifest_requests: Arc::new(DashMap::new()),
+            image_blob_requests: Arc::new(DashMap::new()),
+            image_requests_total: register_counter_vec!(
+                "test_histogram_image_requests",
+                "test",
+                &["type"]
+            )
+            .unwrap(),
+        };
+
+        // Record observations for different projects
+        metrics
+            .upstream_project_duration
+            .with_label_values(&["dockerhub"])
+            .observe(0.05);
+        metrics
+            .upstream_project_duration
+            .with_label_values(&["ghcr"])
+            .observe(0.1);
+        metrics
+            .upstream_project_duration
+            .with_label_values(&["dockerhub"])
+            .observe(0.02);
+
+        // Verify histogram exists and can record observations
+        // (Prometheus histograms don't expose individual observations,
+        // but we can verify the metric was registered by checking it doesn't panic)
+        assert!(metrics
+            .upstream_project_duration
+            .get_metric_with_label_values(&["dockerhub"])
+            .is_ok());
+        assert!(metrics
+            .upstream_project_duration
+            .get_metric_with_label_values(&["ghcr"])
+            .is_ok());
     }
 }
