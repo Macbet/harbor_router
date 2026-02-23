@@ -28,12 +28,22 @@ pub struct Config {
     pub circuit_breaker_threshold: u32,
     pub circuit_breaker_timeout: Duration,
 
+    // Retry
+    /// Maximum retry attempts per upstream request (1 = no retry).
+    pub retry_max_attempts: u32,
+    /// Base delay between retries (exponential backoff: base * 2^attempt).
+    pub retry_base_delay: Duration,
+
     // Connection pool (tuned for 500k RPS)
     pub max_idle_conns_per_host: usize,
     #[allow(dead_code)] // Reserved for future use
     pub max_conns_per_host: usize,
     pub idle_conn_timeout: Duration,
     pub blob_read_timeout: Duration,
+
+    // Cache warming
+    /// Number of top images to persist to Redis for cross-pod cache warming.
+    pub cache_warmup_top_n: usize,
 
     // Performance tuning
     pub listen_backlog: u32,
@@ -88,10 +98,13 @@ impl std::fmt::Debug for Config {
             .field("stale_while_revalidate", &self.stale_while_revalidate)
             .field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
             .field("circuit_breaker_timeout", &self.circuit_breaker_timeout)
+            .field("retry_max_attempts", &self.retry_max_attempts)
+            .field("retry_base_delay", &self.retry_base_delay)
             .field("max_idle_conns_per_host", &self.max_idle_conns_per_host)
             .field("max_conns_per_host", &self.max_conns_per_host)
             .field("idle_conn_timeout", &self.idle_conn_timeout)
             .field("blob_read_timeout", &self.blob_read_timeout)
+            .field("cache_warmup_top_n", &self.cache_warmup_top_n)
             .field("listen_backlog", &self.listen_backlog)
             .field("listen_addr", &self.listen_addr)
             .field("metrics_addr", &self.metrics_addr)
@@ -125,10 +138,13 @@ impl Clone for Config {
             stale_while_revalidate: self.stale_while_revalidate,
             circuit_breaker_threshold: self.circuit_breaker_threshold,
             circuit_breaker_timeout: self.circuit_breaker_timeout,
+            retry_max_attempts: self.retry_max_attempts,
+            retry_base_delay: self.retry_base_delay,
             max_idle_conns_per_host: self.max_idle_conns_per_host,
             max_conns_per_host: self.max_conns_per_host,
             idle_conn_timeout: self.idle_conn_timeout,
             blob_read_timeout: self.blob_read_timeout,
+            cache_warmup_top_n: self.cache_warmup_top_n,
             listen_backlog: self.listen_backlog,
             listen_addr: self.listen_addr.clone(),
             metrics_addr: self.metrics_addr.clone(),
@@ -185,11 +201,14 @@ impl Config {
                 "CIRCUIT_BREAKER_TIMEOUT",
                 Duration::from_secs(30),
             ),
+            retry_max_attempts: env_u32("RETRY_MAX_ATTEMPTS", 2),
+            retry_base_delay: env_duration("RETRY_BASE_DELAY", Duration::from_millis(150)),
             // Connection pool defaults tuned for 500k RPS
             max_idle_conns_per_host: env_usize("MAX_IDLE_CONNS_PER_HOST", 512),
             max_conns_per_host: env_usize("MAX_CONNS_PER_HOST", 0),
             idle_conn_timeout: env_duration("IDLE_CONN_TIMEOUT", Duration::from_secs(90)),
             blob_read_timeout: env_duration("BLOB_READ_TIMEOUT", Duration::from_secs(60)),
+            cache_warmup_top_n: env_usize("CACHE_WARMUP_TOP_N", 100),
             // Performance tuning
             listen_backlog: env_u32("LISTEN_BACKLOG", 8192),
             listen_addr: env_str("LISTEN_ADDR", ":8080"),
