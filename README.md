@@ -102,6 +102,10 @@ All configuration is via environment variables. Duration values accept Go-style 
 | `REDIS_PASSWORD_FILE` | — | Path to file containing Redis password (Vault injector) |
 | `REDIS_DB` | `0` | Redis database number |
 | `REDIS_KEY_PREFIX` | `hr` | Key prefix for cache entries |
+| `NEGATIVE_CACHE_TTL` | `30s` | How long to cache negative lookups for non-existent images |
+| `STALE_WHILE_REVALIDATE` | `60s` | Serve stale cache entries up to this duration while refreshing in background (`0s` to disable) |
+| `CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before a project's circuit opens |
+| `CIRCUIT_BREAKER_TIMEOUT` | `30s` | How long to keep an open circuit before probing again (half-open) |
 
 ## Endpoints
 
@@ -109,6 +113,7 @@ All configuration is via environment variables. Duration values accept Go-style 
 |---|---|
 | `GET /v2/` | Registry API version check |
 | `ANY /v2/{PROXY_PROJECT}/*` | Manifest and blob routing |
+| `GET /v2/{PROXY_PROJECT}/*/tags/list` | Proxied Docker Registry v2 tag list with fan-out and caching |
 | `GET /healthz` | Liveness — `503` if no projects discovered |
 | `GET /readyz` | Readiness — `503` if no projects discovered |
 | `GET /metrics` (`:9090`) | Prometheus metrics |
