@@ -37,6 +37,7 @@ pub struct Metrics {
     /// Upstream request duration by project: result = "ok" | "error".
     pub upstream_project_duration: HistogramVec,
     pub circuit_breaker_state: GaugeVec,
+    pub retries_total: CounterVec,
 
     // ─── Image popularity tracking (lock-free) ────────────────────────────────
     /// Per-image manifest request counts.
@@ -126,6 +127,13 @@ pub fn global() -> &'static Metrics {
             &["project"]
         )
         .expect("register circuit_breaker_state"),
+
+        retries_total: register_counter_vec!(
+            "harbor_router_retries_total",
+            "Total retry attempts by project and reason.",
+            &["project", "reason"]
+        )
+        .expect("register retries_total"),
 
         // Image popularity tracking
         image_manifest_requests: Arc::new(DashMap::with_capacity(MAX_TRACKED_IMAGES)),
@@ -361,6 +369,12 @@ mod tests {
                 &["project"]
             )
             .unwrap(),
+            retries_total: register_counter_vec!(
+                "test_manifest_retries_total",
+                "test",
+                &["project", "reason"]
+            )
+            .unwrap(),
             image_manifest_requests: Arc::new(DashMap::new()),
             image_blob_requests: Arc::new(DashMap::new()),
             image_requests_total: register_counter_vec!(
@@ -441,6 +455,12 @@ mod tests {
                 "test_histogram_circuit_breaker_state",
                 "test",
                 &["project"]
+            )
+            .unwrap(),
+            retries_total: register_counter_vec!(
+                "test_histogram_retries_total",
+                "test",
+                &["project", "reason"]
             )
             .unwrap(),
             image_manifest_requests: Arc::new(DashMap::new()),

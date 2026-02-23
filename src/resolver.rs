@@ -59,6 +59,9 @@ pub struct Resolver {
     cache_ttl: Duration,
     stale_while_revalidate: Duration,
     circuit_breaker: Arc<CircuitBreaker>,
+    retry_max_attempts: u32,
+    retry_base_delay: Duration,
+    cache_warmup_top_n: usize,
 }
 
 impl Resolver {
@@ -76,6 +79,9 @@ impl Resolver {
         http2_prior_knowledge: bool,
         max_fanout: usize,
         circuit_breaker: Arc<CircuitBreaker>,
+        retry_max_attempts: u32,
+        retry_base_delay: Duration,
+        cache_warmup_top_n: usize,
     ) -> Result<Self> {
         // Build an optimized HTTP client for upstream Harbor requests.
         // For 500k RPS, connection reuse is critical.
@@ -113,8 +119,13 @@ impl Resolver {
             cache_ttl,
             stale_while_revalidate,
             circuit_breaker,
+            retry_max_attempts,
+            retry_base_delay,
+            cache_warmup_top_n,
         })
     }
+
+    const WARMUP_CACHE_KEY: &'static str = "warmup:mappings";
 
     /// Resolves a manifest, using cache and singleflight deduplication.
     #[inline]
@@ -163,7 +174,7 @@ impl Resolver {
                     .unwrap_or(false);
 
             match self
-                .fetch_manifest(project, image, reference, auth, accept)
+                .fetch_manifest_with_retry(project, image, reference, auth, accept)
                 .await
             {
                 Ok(r) if r.status == 200 => {
@@ -608,6 +619,70 @@ impl Resolver {
         })
     }
 
+    async fn fetch_manifest_with_retry(
+        &self,
+        project: &str,
+        image: &str,
+        reference: &str,
+        auth: Option<&str>,
+        accept: &[String],
+    ) -> Result<ResolveResult> {
+        let max_attempts = self.retry_max_attempts.max(1);
+
+        for attempt in 0..max_attempts {
+            match self
+                .fetch_manifest(project, image, reference, auth, accept)
+                .await
+            {
+                Ok(result) if is_retryable_status(result.status) && attempt + 1 < max_attempts => {
+                    let delay = self.retry_base_delay * 2u32.pow(attempt);
+                    debug!(
+                        event = "retry",
+                        project,
+                        image,
+                        reference,
+                        attempt = attempt + 1,
+                        max_attempts,
+                        status = result.status,
+                        delay_ms = delay.as_millis() as u64,
+                        "retrying after server error"
+                    );
+                    metrics::global()
+                        .retries_total
+                        .with_label_values(&[project, "server_error"])
+                        .inc();
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Ok(result) => return Ok(result),
+                Err(e) if is_retryable_error(&e) && attempt + 1 < max_attempts => {
+                    let delay = self.retry_base_delay * 2u32.pow(attempt);
+                    let reason = classify_retry_reason(&e);
+                    debug!(
+                        event = "retry",
+                        project,
+                        image,
+                        reference,
+                        attempt = attempt + 1,
+                        max_attempts,
+                        error = %e,
+                        delay_ms = delay.as_millis() as u64,
+                        "retrying after transient error"
+                    );
+                    metrics::global()
+                        .retries_total
+                        .with_label_values(&[project, reason])
+                        .inc();
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                other => return other,
+            }
+        }
+
+        unreachable!("retry loop should always return")
+    }
+
     // ─── tag list resolution ─────────────────────────────────────────────────
 
     /// Resolves a tag list for an image across discovered projects.
@@ -740,6 +815,115 @@ impl Resolver {
             body,
         })
     }
+
+    pub async fn warm_cache_from_redis(&self) {
+        let Some(json) = self.cache.get(Self::WARMUP_CACHE_KEY).await else {
+            debug!(event = "warmup", "no warmup data found in cache");
+            return;
+        };
+
+        match serde_json::from_str::<std::collections::HashMap<String, String>>(&json) {
+            Ok(mappings) if !mappings.is_empty() => {
+                let now = now_epoch_secs();
+                let ttl = self.cache_ttl + self.stale_while_revalidate;
+                let mut count = 0u32;
+                for (key, project) in &mappings {
+                    if !discovery::is_safe_project_name(project) {
+                        continue;
+                    }
+                    let value = if self.stale_while_revalidate.is_zero() {
+                        project.clone()
+                    } else {
+                        encode_cache_value(project, now)
+                    };
+                    self.cache.set_with_ttl(key.clone(), value, ttl).await;
+                    if let Some(image) = key.split(':').next() {
+                        self.cache
+                            .set(format!("img:{}", image), project.clone())
+                            .await;
+                    }
+                    count += 1;
+                }
+                info!(
+                    event = "warmup",
+                    entries = count,
+                    source = "cache",
+                    "warmed manifest cache from shared cache"
+                );
+            }
+            Ok(_) => {
+                debug!(event = "warmup", "warmup data was empty");
+            }
+            Err(e) => {
+                debug!(event = "warmup", error = %e, "failed to parse warmup data");
+            }
+        }
+    }
+
+    pub async fn persist_hot_entries(&self) {
+        if self.cache_warmup_top_n == 0 {
+            return;
+        }
+
+        let top_images = metrics::global().top_manifest_images(self.cache_warmup_top_n);
+        if top_images.is_empty() {
+            return;
+        }
+
+        let mut mappings = std::collections::HashMap::new();
+        for (key, _count) in &top_images {
+            if let Some(cached_value) = self.cache.get(key).await {
+                let (project, _) = decode_cache_value(&cached_value);
+                if project != NEGATIVE_CACHE_SENTINEL && discovery::is_safe_project_name(project) {
+                    mappings.insert(key.clone(), project.to_string());
+                }
+            }
+        }
+
+        if mappings.is_empty() {
+            return;
+        }
+
+        match serde_json::to_string(&mappings) {
+            Ok(json) => {
+                self.cache
+                    .set_with_ttl(
+                        Self::WARMUP_CACHE_KEY.to_string(),
+                        json,
+                        Duration::from_secs(3600),
+                    )
+                    .await;
+                debug!(
+                    event = "warmup",
+                    entries = mappings.len(),
+                    "persisted hot entries to shared cache"
+                );
+            }
+            Err(e) => {
+                debug!(event = "warmup", error = %e, "failed to serialize warmup data");
+            }
+        }
+    }
+
+    pub async fn start_cache_warming(
+        &self,
+        interval: Duration,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        self.warm_cache_from_redis().await;
+
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => self.persist_hot_entries().await,
+                _ = shutdown_rx.changed() => {
+                    info!(event = "warmup", "shutting down cache warming");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Buckets an HTTP status code into a class label for Prometheus metrics.
@@ -765,6 +949,31 @@ fn should_record_transport_failure(error: &anyhow::Error) -> bool {
     !(msg.contains("builder error")
         || msg.contains("invalid URL")
         || msg.contains("relative URL without a base"))
+}
+
+#[inline]
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 502..=504)
+}
+
+#[inline]
+fn is_retryable_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("timeout")
+        || msg.contains("connection")
+        || msg.contains("reset")
+        || msg.contains("broken pipe")
+        || msg.contains("timed out")
+}
+
+#[inline]
+fn classify_retry_reason(err: &anyhow::Error) -> &'static str {
+    let msg = err.to_string();
+    if msg.contains("timeout") || msg.contains("timed out") {
+        "timeout"
+    } else {
+        "connection"
+    }
 }
 
 #[inline]
@@ -874,6 +1083,9 @@ mod tests {
             cache_ttl: Duration::from_secs(60),
             stale_while_revalidate: Duration::ZERO,
             circuit_breaker: Arc::new(CircuitBreaker::new(5, 30)),
+            retry_max_attempts: 1,
+            retry_base_delay: Duration::from_millis(50),
+            cache_warmup_top_n: 0,
         }
     }
 
@@ -1056,6 +1268,252 @@ mod tests {
         assert!(
             metric.get_sample_count() > 0,
             "Expected at least one observation in histogram for project 'dockerhub'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"schemaVersion":2}"#))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut resolver = setup_test_resolver(&mock_server.uri());
+        resolver.retry_max_attempts = 3;
+        resolver.retry_base_delay = Duration::from_millis(10);
+
+        let result = resolver
+            .fetch_manifest_with_retry("dockerhub", "nginx", "latest", None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, 200);
+    }
+
+    #[tokio::test]
+    async fn test_retry_no_retry_on_client_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let mut resolver = setup_test_resolver(&mock_server.uri());
+        resolver.retry_max_attempts = 3;
+
+        let result = resolver
+            .fetch_manifest_with_retry("dockerhub", "nginx", "latest", None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, 404);
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should report requests");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_retry_exhausts_all_attempts() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&mock_server)
+            .await;
+
+        let mut resolver = setup_test_resolver(&mock_server.uri());
+        resolver.retry_max_attempts = 2;
+        resolver.retry_base_delay = Duration::from_millis(5);
+
+        let result = resolver
+            .fetch_manifest_with_retry("dockerhub", "nginx", "latest", None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, 502);
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should report requests");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_retry_disabled_when_max_attempts_is_one() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/dockerhub/nginx/manifests/latest"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&mock_server)
+            .await;
+
+        let mut resolver = setup_test_resolver(&mock_server.uri());
+        resolver.retry_max_attempts = 1;
+
+        let result = resolver
+            .fetch_manifest_with_retry("dockerhub", "nginx", "latest", None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, 502);
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should report requests");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn test_helper_is_retryable_status() {
+        assert!(is_retryable_status(502));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(504));
+
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(500));
+        assert!(!is_retryable_status(501));
+    }
+
+    #[test]
+    fn test_helper_is_retryable_error() {
+        assert!(is_retryable_error(&anyhow::anyhow!("connection reset")));
+        assert!(is_retryable_error(&anyhow::anyhow!("timeout")));
+        assert!(is_retryable_error(&anyhow::anyhow!("timed out")));
+        assert!(is_retryable_error(&anyhow::anyhow!("broken pipe")));
+
+        assert!(!is_retryable_error(&anyhow::anyhow!("invalid URL")));
+        assert!(!is_retryable_error(&anyhow::anyhow!("random error")));
+    }
+
+    #[tokio::test]
+    async fn test_warm_cache_from_redis() {
+        let mock_server = MockServer::start().await;
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        resolver
+            .cache
+            .set(
+                Resolver::WARMUP_CACHE_KEY.to_string(),
+                r#"{"nginx:latest":"dockerhub","redis:7.0":"ghcr"}"#.to_string(),
+            )
+            .await;
+
+        resolver.warm_cache_from_redis().await;
+
+        assert_eq!(
+            resolver.cache.get(&"nginx:latest".to_string()).await,
+            Some("dockerhub".to_string())
+        );
+        assert_eq!(
+            resolver.cache.get(&"img:nginx".to_string()).await,
+            Some("dockerhub".to_string())
+        );
+        assert_eq!(
+            resolver.cache.get(&"redis:7.0".to_string()).await,
+            Some("ghcr".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_warm_cache_skips_unsafe_projects() {
+        let mock_server = MockServer::start().await;
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        resolver
+            .cache
+            .set(
+                Resolver::WARMUP_CACHE_KEY.to_string(),
+                r#"{"nginx:latest":"../admin"}"#.to_string(),
+            )
+            .await;
+
+        resolver.warm_cache_from_redis().await;
+
+        assert_eq!(resolver.cache.get(&"nginx:latest".to_string()).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_warm_cache_handles_missing_data() {
+        let mock_server = MockServer::start().await;
+        let resolver = setup_test_resolver(&mock_server.uri());
+
+        resolver.warm_cache_from_redis().await;
+    }
+
+    #[tokio::test]
+    async fn test_persist_hot_entries_and_warm_roundtrip() {
+        let mock_server = MockServer::start().await;
+        let mut resolver = setup_test_resolver(&mock_server.uri());
+        resolver.cache_warmup_top_n = 10;
+
+        resolver
+            .cache
+            .set(
+                "warm-roundtrip-nginx:latest".to_string(),
+                "dockerhub".to_string(),
+            )
+            .await;
+
+        for _ in 0..10 {
+            metrics::global().record_manifest_request("warm-roundtrip-nginx", "latest");
+        }
+
+        resolver.persist_hot_entries().await;
+
+        let warmup_json = resolver
+            .cache
+            .get(&Resolver::WARMUP_CACHE_KEY.to_string())
+            .await
+            .expect("warmup mappings should be persisted");
+        let mappings: std::collections::HashMap<String, String> =
+            serde_json::from_str(&warmup_json).expect("warmup mappings should be valid json");
+        assert_eq!(
+            mappings.get("warm-roundtrip-nginx:latest"),
+            Some(&"dockerhub".to_string())
+        );
+
+        let second_mock_server = MockServer::start().await;
+        let second_resolver = setup_test_resolver(&second_mock_server.uri());
+        second_resolver
+            .cache
+            .set(Resolver::WARMUP_CACHE_KEY.to_string(), warmup_json)
+            .await;
+
+        second_resolver.warm_cache_from_redis().await;
+
+        assert_eq!(
+            second_resolver
+                .cache
+                .get(&"warm-roundtrip-nginx:latest".to_string())
+                .await,
+            Some("dockerhub".to_string())
+        );
+        assert_eq!(
+            second_resolver
+                .cache
+                .get(&"img:warm-roundtrip-nginx".to_string())
+                .await,
+            Some("dockerhub".to_string())
         );
     }
 

@@ -102,6 +102,9 @@ async fn async_main() -> Result<()> {
         max_fanout = cfg.max_fanout_projects,
         http2_prior_knowledge = cfg.http2_prior_knowledge,
         rate_limit_per_ip = cfg.rate_limit_per_ip,
+        retry_max_attempts = cfg.retry_max_attempts,
+        retry_base_delay_ms = cfg.retry_base_delay.as_millis() as u64,
+        cache_warmup_top_n = cfg.cache_warmup_top_n,
         "starting harbor-router (high-performance mode)"
     );
 
@@ -168,9 +171,12 @@ async fn async_main() -> Result<()> {
         cfg.http2_prior_knowledge,
         cfg.max_fanout_projects,
         circuit_breaker,
+        cfg.retry_max_attempts,
+        cfg.retry_base_delay,
+        cfg.cache_warmup_top_n,
     )?;
     let app_state = proxy::AppState::new(
-        res,
+        res.clone(),
         cfg.harbor_url.clone(),
         cfg.proxy_project.clone(),
         cfg.http2_prior_knowledge,
@@ -191,6 +197,15 @@ async fn async_main() -> Result<()> {
     let discovery_interval = cfg.discovery_interval;
     let disc_handle = tokio::spawn(async move {
         disc_clone.start(discovery_interval, shutdown_rx).await;
+    });
+
+    let res_for_warmup = res.clone();
+    let warmup_interval = cfg.discovery_interval;
+    let warmup_shutdown_rx = shutdown_tx.subscribe();
+    let warmup_handle = tokio::spawn(async move {
+        res_for_warmup
+            .start_cache_warming(warmup_interval, warmup_shutdown_rx)
+            .await;
     });
 
     // Give discovery a moment to populate before accepting traffic.
@@ -263,6 +278,7 @@ async fn async_main() -> Result<()> {
 
     let _ = shutdown_tx.send(true);
     let _ = disc_handle.await;
+    let _ = warmup_handle.await;
     info!("harbor-router stopped");
     Ok(())
 }
