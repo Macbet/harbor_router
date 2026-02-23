@@ -134,9 +134,7 @@ pub async fn registry_handler(
         Ok((image, PathKind::Blobs, digest)) => {
             handle_blob(&state, image, digest, auth_header).await
         }
-        Ok((image, PathKind::Tags, _)) => {
-            handle_tags(&state, image, auth_header.as_deref()).await
-        }
+        Ok((image, PathKind::Tags, _)) => handle_tags(&state, image, auth_header.as_deref()).await,
     }
 }
 
@@ -196,11 +194,7 @@ async fn handle_manifest(
 
 // ─── tags ────────────────────────────────────────────────────────────────────
 
-async fn handle_tags(
-    state: &AppState,
-    image: &str,
-    auth: Option<&str>,
-) -> Response {
+async fn handle_tags(state: &AppState, image: &str, auth: Option<&str>) -> Response {
     let start = Instant::now();
     let result = state.resolver.resolve_tags(image, auth).await;
     let duration_ms = start.elapsed().as_millis() as u64;

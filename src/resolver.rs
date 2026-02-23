@@ -304,7 +304,6 @@ impl Resolver {
         self.discovery.get_projects()
     }
 
-
     // ─── singleflight (lock-free with DashMap) ───────────────────────────────
 
     async fn singleflight(
@@ -715,10 +714,7 @@ impl Resolver {
                 project
             );
         }
-        let url = format!(
-            "{}/v2/{}/{}/tags/list",
-            self.harbor_url, project, image
-        );
+        let url = format!("{}/v2/{}/{}/tags/list", self.harbor_url, project, image);
 
         let mut req = self.client.get(&url);
         if let Some(a) = auth {
@@ -1495,37 +1491,74 @@ mod tests {
 
         // Exact match
         let accept = vec![docker_ct.to_string()];
-        assert!(content_type_matches(docker_ct, &accept), "exact match should succeed");
+        assert!(
+            content_type_matches(docker_ct, &accept),
+            "exact match should succeed"
+        );
 
         // No match
-        assert!(!content_type_matches(oci_ct, &accept), "different type should not match");
+        assert!(
+            !content_type_matches(oci_ct, &accept),
+            "different type should not match"
+        );
 
         // Wildcard */*
         let accept_wildcard = vec!["*/*".to_string()];
-        assert!(content_type_matches(docker_ct, &accept_wildcard), "*/* should match anything");
-        assert!(content_type_matches(oci_ct, &accept_wildcard), "*/* should match anything");
+        assert!(
+            content_type_matches(docker_ct, &accept_wildcard),
+            "*/* should match anything"
+        );
+        assert!(
+            content_type_matches(oci_ct, &accept_wildcard),
+            "*/* should match anything"
+        );
 
         // application/* wildcard
         let accept_app_wildcard = vec!["application/*".to_string()];
-        assert!(content_type_matches(docker_ct, &accept_app_wildcard), "application/* should match application types");
-        assert!(content_type_matches(oci_ct, &accept_app_wildcard), "application/* should match application types");
-        assert!(!content_type_matches("text/plain", &accept_app_wildcard), "application/* should not match text/plain");
+        assert!(
+            content_type_matches(docker_ct, &accept_app_wildcard),
+            "application/* should match application types"
+        );
+        assert!(
+            content_type_matches(oci_ct, &accept_app_wildcard),
+            "application/* should match application types"
+        );
+        assert!(
+            !content_type_matches("text/plain", &accept_app_wildcard),
+            "application/* should not match text/plain"
+        );
 
         // Content-Type with parameters (strip after ;)
         let ct_with_params = "application/vnd.docker.distribution.manifest.v2+json; charset=utf-8";
-        assert!(content_type_matches(ct_with_params, &accept), "should strip params after ;");
+        assert!(
+            content_type_matches(ct_with_params, &accept),
+            "should strip params after ;"
+        );
 
         // Accept with parameters (strip after ;)
-        let accept_with_params = vec!["application/vnd.docker.distribution.manifest.v2+json; q=0.9".to_string()];
-        assert!(content_type_matches(docker_ct, &accept_with_params), "should strip accept params after ;");
+        let accept_with_params =
+            vec!["application/vnd.docker.distribution.manifest.v2+json; q=0.9".to_string()];
+        assert!(
+            content_type_matches(docker_ct, &accept_with_params),
+            "should strip accept params after ;"
+        );
 
         // Empty accept list — no match
-        assert!(!content_type_matches(docker_ct, &[]), "empty accept should not match");
+        assert!(
+            !content_type_matches(docker_ct, &[]),
+            "empty accept should not match"
+        );
 
         // Multiple accept values — match if any matches
         let accept_multi = vec![oci_ct.to_string(), docker_ct.to_string()];
-        assert!(content_type_matches(docker_ct, &accept_multi), "should match any in list");
-        assert!(content_type_matches(oci_ct, &accept_multi), "should match any in list");
+        assert!(
+            content_type_matches(docker_ct, &accept_multi),
+            "should match any in list"
+        );
+        assert!(
+            content_type_matches(oci_ct, &accept_multi),
+            "should match any in list"
+        );
     }
 
     #[tokio::test]
@@ -1546,10 +1579,10 @@ mod tests {
         // dockerhub returns OCI format
         Mock::given(method("GET"))
             .and(path("/v2/dockerhub/nginx/manifests/latest"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(r#"{"schemaVersion": 2}"#, "application/vnd.oci.image.manifest.v1+json"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"schemaVersion": 2}"#,
+                "application/vnd.oci.image.manifest.v1+json",
+            ))
             .mount(&mock_server)
             .await;
 
@@ -1558,7 +1591,10 @@ mod tests {
             .and(path("/v2/ghcr/nginx/manifests/latest"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_raw(r#"{"schemaVersion": 2}"#, "application/vnd.docker.distribution.manifest.v2+json")
+                    .set_body_raw(
+                        r#"{"schemaVersion": 2}"#,
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    )
                     .set_delay(Duration::from_millis(50)),
             )
             .mount(&mock_server)
@@ -1584,16 +1620,17 @@ mod tests {
         .expect("discovery should populate projects");
 
         // Client prefers Docker format
-        let accept = vec![
-            "application/vnd.docker.distribution.manifest.v2+json".to_string(),
-        ];
+        let accept = vec!["application/vnd.docker.distribution.manifest.v2+json".to_string()];
         let result = resolver
             .resolve_manifest("nginx", "latest", None, &accept)
             .await
             .expect("should resolve manifest");
 
         // Should pick ghcr (Docker format) even though dockerhub (OCI) responded first
-        assert_eq!(result.project, "ghcr", "should select project matching Accept header");
+        assert_eq!(
+            result.project, "ghcr",
+            "should select project matching Accept header"
+        );
 
         discovery_task.abort();
     }
@@ -1616,19 +1653,19 @@ mod tests {
         // Both projects return 200 but with content types that don't match Accept
         Mock::given(method("GET"))
             .and(path("/v2/dockerhub/nginx/manifests/latest"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(r#"{"schemaVersion": 2}"#, "application/vnd.oci.image.manifest.v1+json"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"schemaVersion": 2}"#,
+                "application/vnd.oci.image.manifest.v1+json",
+            ))
             .mount(&mock_server)
             .await;
 
         Mock::given(method("GET"))
             .and(path("/v2/ghcr/nginx/manifests/latest"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(r#"{"schemaVersion": 2}"#, "application/vnd.oci.image.manifest.v1+json"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"schemaVersion": 2}"#,
+                "application/vnd.oci.image.manifest.v1+json",
+            ))
             .mount(&mock_server)
             .await;
 
@@ -1652,9 +1689,7 @@ mod tests {
         .expect("discovery should populate projects");
 
         // Client wants a type that no project returns
-        let accept = vec![
-            "application/vnd.docker.distribution.manifest.list.v2+json".to_string(),
-        ];
+        let accept = vec!["application/vnd.docker.distribution.manifest.list.v2+json".to_string()];
         let result = resolver
             .resolve_manifest("nginx", "latest", None, &accept)
             .await
@@ -1777,7 +1812,10 @@ mod tests {
             3,
             "expected 2 fan-out + 1 cache-hit fetch, got {}: {:?}",
             tag_requests.len(),
-            tag_requests.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+            tag_requests
+                .iter()
+                .map(|r| r.url.path())
+                .collect::<Vec<_>>()
         );
 
         discovery_task.abort();
