@@ -104,6 +104,13 @@ async fn async_main() -> Result<()> {
         "starting harbor-router (high-performance mode)"
     );
 
+    if config::should_warn_plaintext_url(&cfg.harbor_url) {
+        warn!("HARBOR_URL uses plaintext HTTP — use https:// in production");
+    }
+    if cfg.rate_limit_per_ip == 0 {
+        warn!("rate limiting disabled (RATE_LIMIT_PER_IP=0) — consider enabling for production");
+    }
+
     // ── core components ───────────────────────────────────────────────────────
     let ttl_cache: cache::Cache = if cfg.redis_sentinels.is_empty() {
         info!("cache backend: moka (in-memory)");
@@ -125,6 +132,7 @@ async fn async_main() -> Result<()> {
             cfg.redis_db,
             cfg.cache_ttl,
             cfg.redis_key_prefix.clone(),
+            cfg.redis_tls,
         )
         .await?
     };
@@ -141,8 +149,7 @@ async fn async_main() -> Result<()> {
         secrecy::SecretString::from(cfg.harbor_username.expose_secret().to_string()),
         secrecy::SecretString::from(cfg.harbor_password.expose_secret().to_string()),
         disc_cache,
-    );
-
+    )?;
     let res = resolver::Resolver::new(
         disc.clone(),
         ttl_cache,
@@ -152,14 +159,14 @@ async fn async_main() -> Result<()> {
         cfg.idle_conn_timeout,
         cfg.http2_prior_knowledge,
         cfg.max_fanout_projects,
-    );
-
+    )?;
     let app_state = proxy::AppState::new(
         res,
         cfg.harbor_url.clone(),
         cfg.proxy_project.clone(),
         cfg.http2_prior_knowledge,
-    );
+        cfg.blob_read_timeout,
+    )?;
 
     // ── rate limiter (per-IP) ─────────────────────────────────────────────────
     let rate_limiter: Option<Arc<IpRateLimiter>> = if cfg.rate_limit_per_ip > 0 {
@@ -170,10 +177,11 @@ async fn async_main() -> Result<()> {
     };
 
     // ── start background discovery ────────────────────────────────────────────
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let disc_clone = disc.clone();
     let discovery_interval = cfg.discovery_interval;
     let disc_handle = tokio::spawn(async move {
-        disc_clone.start(discovery_interval).await;
+        disc_clone.start(discovery_interval, shutdown_rx).await;
     });
 
     // Give discovery a moment to populate before accepting traffic.
@@ -205,6 +213,8 @@ async fn async_main() -> Result<()> {
             rate_limit_middleware(rate_limiter_for_middleware.clone(), req, next)
         }))
         .layer(middleware::from_fn(proxy::logging_middleware))
+        // Defense-in-depth: 2MB body limit (all routes are GET-only, but limit as precaution)
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(app_state.clone());
 
     // ── metrics router ────────────────────────────────────────────────────────
@@ -242,7 +252,8 @@ async fn async_main() -> Result<()> {
         error!(error = %e, "metrics server error");
     }
 
-    disc_handle.abort();
+    let _ = shutdown_tx.send(true);
+    let _ = disc_handle.await;
     info!("harbor-router stopped");
     Ok(())
 }

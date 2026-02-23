@@ -27,6 +27,7 @@ pub struct Config {
     #[allow(dead_code)] // Reserved for future use
     pub max_conns_per_host: usize,
     pub idle_conn_timeout: Duration,
+    pub blob_read_timeout: Duration,
 
     // Performance tuning
     pub listen_backlog: u32,
@@ -59,6 +60,8 @@ pub struct Config {
     /// Key prefix for cache entries (default: "hr").
     pub redis_key_prefix: String,
 
+    /// Enable TLS for Redis Sentinel connections (default: false).
+    pub redis_tls: bool,
     // Observability
     pub log_level: String,
     pub log_format: String,
@@ -78,6 +81,7 @@ impl std::fmt::Debug for Config {
             .field("max_idle_conns_per_host", &self.max_idle_conns_per_host)
             .field("max_conns_per_host", &self.max_conns_per_host)
             .field("idle_conn_timeout", &self.idle_conn_timeout)
+            .field("blob_read_timeout", &self.blob_read_timeout)
             .field("listen_backlog", &self.listen_backlog)
             .field("listen_addr", &self.listen_addr)
             .field("metrics_addr", &self.metrics_addr)
@@ -90,6 +94,7 @@ impl std::fmt::Debug for Config {
             .field("redis_password", &"[REDACTED]")
             .field("redis_db", &self.redis_db)
             .field("redis_key_prefix", &self.redis_key_prefix)
+            .field("redis_tls", &self.redis_tls)
             .field("log_level", &self.log_level)
             .field("log_format", &self.log_format)
             .field("enable_pprof", &self.enable_pprof)
@@ -109,6 +114,7 @@ impl Clone for Config {
             max_idle_conns_per_host: self.max_idle_conns_per_host,
             max_conns_per_host: self.max_conns_per_host,
             idle_conn_timeout: self.idle_conn_timeout,
+            blob_read_timeout: self.blob_read_timeout,
             listen_backlog: self.listen_backlog,
             listen_addr: self.listen_addr.clone(),
             metrics_addr: self.metrics_addr.clone(),
@@ -124,6 +130,7 @@ impl Clone for Config {
                 .map(|s| SecretString::from(s.expose_secret().to_string())),
             redis_db: self.redis_db,
             redis_key_prefix: self.redis_key_prefix.clone(),
+            redis_tls: self.redis_tls,
             log_level: self.log_level.clone(),
             log_format: self.log_format.clone(),
             enable_pprof: self.enable_pprof,
@@ -161,6 +168,7 @@ impl Config {
             max_idle_conns_per_host: env_usize("MAX_IDLE_CONNS_PER_HOST", 512),
             max_conns_per_host: env_usize("MAX_CONNS_PER_HOST", 0),
             idle_conn_timeout: env_duration("IDLE_CONN_TIMEOUT", Duration::from_secs(90)),
+            blob_read_timeout: env_duration("BLOB_READ_TIMEOUT", Duration::from_secs(60)),
             // Performance tuning
             listen_backlog: env_u32("LISTEN_BACKLOG", 8192),
             listen_addr: env_str("LISTEN_ADDR", ":8080"),
@@ -189,6 +197,7 @@ impl Config {
                 v as u8
             },
             redis_key_prefix: env_str("REDIS_KEY_PREFIX", "hr"),
+            redis_tls: env_bool("REDIS_TLS", false),
             // Observability
             log_level: env_str("LOG_LEVEL", "info"),
             log_format: env_str("LOG_FORMAT", "pretty"), // "pretty" or "json"
@@ -304,6 +313,18 @@ fn parse_go_duration(s: &str) -> Option<Duration> {
         total_ms += ms;
     }
     Some(Duration::from_millis(total_ms))
+}
+
+/// Returns true if the URL uses plaintext HTTP and is NOT a known-safe local address.
+/// Safe local addresses: localhost, 127.0.0.1, harbor-core
+pub fn should_warn_plaintext_url(url: &str) -> bool {
+    if !url.starts_with("http://") {
+        return false;
+    }
+    let host_part = &url["http://".len()..];
+    let host = host_part.split(':').next().unwrap_or(host_part);
+    let host = host.split('/').next().unwrap_or(host);
+    !matches!(host, "localhost" | "127.0.0.1" | "harbor-core")
 }
 
 #[cfg(test)]
@@ -431,5 +452,30 @@ mod tests {
 
         let result = env_str_or_file("TEST_SECRET_5").unwrap();
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_should_warn_plaintext_url_http_remote() {
+        assert!(should_warn_plaintext_url("http://harbor.example.com"));
+    }
+
+    #[test]
+    fn test_should_warn_plaintext_url_https() {
+        assert!(!should_warn_plaintext_url("https://harbor.example.com"));
+    }
+
+    #[test]
+    fn test_should_warn_plaintext_url_localhost() {
+        assert!(!should_warn_plaintext_url("http://localhost:8080"));
+    }
+
+    #[test]
+    fn test_should_warn_plaintext_url_127_0_0_1() {
+        assert!(!should_warn_plaintext_url("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn test_should_warn_plaintext_url_harbor_core() {
+        assert!(!should_warn_plaintext_url("http://harbor-core:80"));
     }
 }

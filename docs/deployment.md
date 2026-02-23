@@ -229,3 +229,25 @@ kubectl scale deploy/harbor-router --replicas=4
 | Connection pool exhausted | `upstream_requests_total` errors | Increase `MAX_IDLE_CONNS_PER_HOST` |
 | Too many fan-outs | Low cache hit rate | Increase `CACHE_TTL` |
 | TCP backlog drops | `netstat -s \| grep overflow` | Increase `LISTEN_BACKLOG` |
+
+---
+
+## Security: Authentication
+
+harbor-router **does not authenticate clients**. It passes `Authorization` headers through to Harbor, which performs the actual credential validation.
+
+For production deployments, ensure one of the following:
+
+- **Authenticating reverse proxy** — place nginx, Envoy, or an OAuth2 proxy in front of harbor-router to authenticate clients before requests reach the router
+- **Trusted network boundary** — deploy harbor-router within a private network (e.g., Kubernetes cluster network) where only authorized services can reach it
+- **Ingress auth** — configure your ingress controller (nginx-ingress, Istio, etc.) to require authentication before forwarding to harbor-router
+
+Example: nginx basic auth in front of harbor-router:
+
+```nginx
+location /v2/ {
+    auth_basic "Registry";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+    proxy_pass http://harbor-router:8080;
+}
+```

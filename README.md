@@ -49,6 +49,8 @@ docker pull registry.example.com/proxy/nginx:latest
 #                                   ^^^^^ PROXY_PROJECT (default: "proxy")
 ```
 
+> **Security note**: harbor-router delegates authentication to Harbor. For production, deploy behind an authenticating reverse proxy or within a trusted network boundary. See [docs/deployment.md](docs/deployment.md#security-authentication) for details.
+
 ## Build
 
 ```bash

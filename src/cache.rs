@@ -81,6 +81,7 @@ impl RedisCache {
     /// `master_name`  — Sentinel master group name (e.g. `"mymaster"`)
     /// `password`     — optional Redis AUTH password
     /// `db`           — Redis database number
+    /// `tls`          — enable TLS for Redis connections
     pub async fn from_sentinel(
         sentinels: &str,
         master_name: &str,
@@ -88,7 +89,9 @@ impl RedisCache {
         db: u8,
         ttl: Duration,
         prefix: String,
+        tls: bool,
     ) -> anyhow::Result<Cache> {
+        let scheme = if tls { "rediss" } else { "redis" };
         let sentinel_urls: Vec<String> = sentinels
             .split(',')
             .filter_map(|s| {
@@ -96,7 +99,7 @@ impl RedisCache {
                 if s.is_empty() {
                     return None;
                 }
-                Some(format!("redis://{}", s))
+                Some(format!("{}://{}", scheme, s))
             })
             .collect();
 
@@ -111,8 +114,11 @@ impl RedisCache {
             redis_conn_info
         };
 
-        let node_conn_info = redis::sentinel::SentinelNodeConnectionInfo::default()
+        let mut node_conn_info = redis::sentinel::SentinelNodeConnectionInfo::default()
             .set_redis_connection_info(redis_conn_info);
+        if tls {
+            node_conn_info = node_conn_info.set_tls_mode(redis::TlsMode::Insecure);
+        }
 
         let mut client = redis::sentinel::SentinelClient::build(
             sentinel_urls,

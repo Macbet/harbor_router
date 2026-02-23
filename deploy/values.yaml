@@ -51,6 +51,8 @@ config:
 redis:
   # -- Comma-separated Redis Sentinel endpoints (e.g. "sentinel1:26379,sentinel2:26379")
   sentinels: ""
+  # -- Enable TLS for Redis sentinel connections (uses rediss:// protocol)
+  tls: false
   # -- Sentinel master group name
   masterName: "mymaster"
   auth:
