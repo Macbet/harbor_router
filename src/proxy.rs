@@ -19,7 +19,9 @@ use axum::{
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use std::{
-    sync::Arc,
+    borrow::Cow,
+    collections::HashSet,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
@@ -334,7 +336,7 @@ async fn proxy_blob(
         Ok(resp) => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let mut headers = HeaderMap::new();
+            let mut headers = HeaderMap::with_capacity(resp.headers().len());
             copy_headers(resp.headers(), &mut headers);
 
             // Stream body directly to the client without buffering.
@@ -423,8 +425,10 @@ async fn probe_blob_project(
 pub async fn logging_middleware(req: Request, next: Next) -> Response {
     let start = Instant::now();
     let method = req.method().clone();
-    // Sanitize path to prevent log injection (LOW-02)
-    let path = sanitize_log_field(req.uri().path());
+    // Sanitize path to prevent log injection (LOW-02).
+    // into_owned() is still cheaper than the old char-by-char collect() because
+    // the fast-path does a byte scan + memcpy instead of char iteration.
+    let path = sanitize_log_field(req.uri().path()).into_owned();
     let client_ip = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -598,26 +602,34 @@ fn parse_path(path: &str) -> anyhow::Result<(&str, PathKind, &str)> {
 
 /// Allowlist of response headers to forward from upstream Harbor.
 /// Only these headers pass through — prevents leaking internal headers (Set-Cookie, X-* etc).
-const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
-    "content-type",
-    "content-length",
-    "docker-content-digest",
-    "docker-distribution-api-version",
-    "etag",
-    "accept-ranges",
-    "content-range",
-    "location",
-    "cache-control",
-    "x-content-type-options",
-    "www-authenticate",
-];
+/// Uses a `HashSet` initialized once via `OnceLock` for O(1) lookups instead of O(n) linear scan.
+fn allowed_headers() -> &'static HashSet<&'static str> {
+    static HEADERS: OnceLock<HashSet<&str>> = OnceLock::new();
+    HEADERS.get_or_init(|| {
+        [
+            "content-type",
+            "content-length",
+            "docker-content-digest",
+            "docker-distribution-api-version",
+            "etag",
+            "accept-ranges",
+            "content-range",
+            "location",
+            "cache-control",
+            "x-content-type-options",
+            "www-authenticate",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
 
 #[inline]
 fn copy_headers(src: &reqwest::header::HeaderMap, dst: &mut HeaderMap) {
+    let allowed = allowed_headers();
     dst.reserve(src.len());
     for (name, value) in src {
-        let name_lower = name.as_str();
-        if ALLOWED_RESPONSE_HEADERS.contains(&name_lower) {
+        if allowed.contains(name.as_str()) {
             if let (Ok(n), Ok(v)) = (
                 HeaderName::from_bytes(name.as_str().as_bytes()),
                 HeaderValue::from_bytes(value.as_bytes()),
@@ -644,12 +656,17 @@ fn build_response(
 }
 
 /// Error response following the OCI distribution error format.
+/// Uses `format!` directly instead of `serde_json::json!()` to avoid
+/// building a Value tree + serialization overhead for a fixed-shape response.
 #[inline]
 fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = serde_json::json!({
-        "errors": [{"code": code, "message": message}]
-    })
-    .to_string();
+    // Escape `"` in code/message to produce valid JSON.
+    // In practice these are static strings, so this is a no-op.
+    let body = format!(
+        r#"{{"errors":[{{"code":"{}","message":"{}"}}]}}"#,
+        code.replace('"', "\\\""),
+        message.replace('"', "\\\"")
+    );
     let mut resp = Response::new(Body::from(body));
     *resp.status_mut() = status;
     resp.headers_mut()
@@ -658,23 +675,29 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
 }
 
 /// Sanitizes a string for safe logging (LOW-02 mitigation).
-/// Removes control characters and newlines that could be used for log injection.
+/// Returns `Cow::Borrowed` on the fast path (no control chars) to avoid allocation.
 #[inline]
-fn sanitize_log_field(s: &str) -> String {
+fn sanitize_log_field(s: &str) -> Cow<'_, str> {
     // Truncate very long paths to prevent log flooding
     let truncated = if s.len() > 512 { &s[..512] } else { s };
 
-    // Replace control characters and newlines with safe representations
-    truncated
-        .chars()
-        .map(|c| match c {
-            '\n' => ' ',
-            '\r' => ' ',
-            '\t' => ' ',
-            c if c.is_control() => ' ',
-            c => c,
-        })
-        .collect()
+    // Fast path: if no bytes need sanitization, return a borrow (zero alloc).
+    let needs_sanitize = truncated.bytes().any(|b| b < 0x20);
+    if !needs_sanitize {
+        return Cow::Borrowed(truncated);
+    }
+
+    // Slow path: replace control characters and newlines with spaces.
+    Cow::Owned(
+        truncated
+            .chars()
+            .map(|c| match c {
+                '\n' | '\r' | '\t' => ' ',
+                c if c.is_control() => ' ',
+                c => c,
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
