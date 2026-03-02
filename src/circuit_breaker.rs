@@ -127,6 +127,13 @@ impl CircuitBreaker {
     }
 
     fn project_health(&self, project: &str) -> Ref<'_, String, ProjectHealth> {
+        // Fast path: project already tracked (common case at 500k RPS).
+        // Avoids the String allocation from entry() on every call.
+        if let Some(r) = self.projects.get(project) {
+            return r;
+        }
+        // Cold path: first time seeing this project — insert default.
+        // String allocation + double lookup only happens once per project.
         self.projects.entry(project.to_string()).or_default();
         self.projects
             .get(project)
