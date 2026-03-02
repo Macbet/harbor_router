@@ -36,6 +36,20 @@ struct Flight {
 /// At 500k RPS, mutex contention would be a major bottleneck.
 type Flights = Arc<DashMap<String, Arc<Flight>>>;
 
+/// RAII guard that removes a singleflight entry from the DashMap on drop.
+/// Ensures cleanup even if the leader task panics, preventing permanently
+/// stuck followers and DashMap memory leaks.
+struct FlightGuard {
+    flights: Flights,
+    key: String,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        self.flights.remove(&self.key);
+    }
+}
+
 /// Resolver fans out manifest requests to all discovered proxy-cache projects
 /// in parallel and returns the first successful response.
 ///
@@ -373,6 +387,12 @@ impl Resolver {
         }
 
         // We are the leader — do the actual work.
+        // FlightGuard ensures cleanup even if parallel_lookup panics.
+        let _guard = FlightGuard {
+            flights: Arc::clone(&self.flights),
+            key: key.clone(),
+        };
+
         let res = self
             .parallel_lookup(image, reference, auth, accept)
             .await
@@ -382,9 +402,7 @@ impl Resolver {
         let watch_val = res.as_ref().map(Arc::clone).map_err(|e| e.to_string());
         let _ = tx.send(Some(watch_val));
 
-        // Remove from in-flight map.
-        self.flights.remove(&key);
-
+        // _guard drops here, removing from in-flight map.
         res
     }
 
