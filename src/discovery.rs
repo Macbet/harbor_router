@@ -214,9 +214,9 @@ impl Discoverer {
     /// Paginates through all Harbor projects and returns the names of those
     /// with a non-null `registry_id` (proxy-cache projects).
     async fn fetch_proxy_cache_projects(&self) -> Result<Vec<String>> {
-        let mut result = Vec::new();
         let mut page = 1u32;
         let page_size = 100u32;
+        let mut result = Vec::with_capacity(page_size as usize);
 
         loop {
             let url = format!(

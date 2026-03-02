@@ -251,7 +251,7 @@ impl Metrics {
 pub fn render() -> anyhow::Result<String> {
     let encoder = TextEncoder::new();
     let families = prometheus::gather();
-    let mut buf = String::new();
+    let mut buf = String::with_capacity(8192);
     encoder.encode_utf8(&families, &mut buf)?;
 
     // Append custom top-N image metrics
