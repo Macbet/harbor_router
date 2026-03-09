@@ -19,6 +19,7 @@ use axum::{
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use std::{
+    borrow::Cow,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -122,9 +123,10 @@ pub async fn registry_handler(
             error_response(StatusCode::BAD_REQUEST, "UNSUPPORTED", &e.to_string())
         }
         Ok((image, PathKind::Manifests, reference)) => {
+            let image = normalize_docker_library_image(image);
             handle_manifest(
                 &state,
-                image,
+                &image,
                 reference,
                 auth_header.as_deref(),
                 &accept_headers,
@@ -132,9 +134,13 @@ pub async fn registry_handler(
             .await
         }
         Ok((image, PathKind::Blobs, digest)) => {
-            handle_blob(&state, image, digest, auth_header).await
+            let image = normalize_docker_library_image(image);
+            handle_blob(&state, &image, digest, auth_header).await
         }
-        Ok((image, PathKind::Tags, _)) => handle_tags(&state, image, auth_header.as_deref()).await,
+        Ok((image, PathKind::Tags, _)) => {
+            let image = normalize_docker_library_image(image);
+            handle_tags(&state, &image, auth_header.as_deref()).await
+        }
     }
 }
 
@@ -547,6 +553,18 @@ fn is_safe_reference(reference: &str) -> bool {
         && reference == reference.trim()
 }
 
+/// Docker Hub requires `library/` prefix for official single-segment images
+/// (e.g. `nginx` → `library/nginx`). Docker CLI adds this automatically when
+/// pulling from Docker Hub directly, but not through custom registries.
+#[inline]
+fn normalize_docker_library_image(image: &str) -> Cow<'_, str> {
+    if image.contains('/') {
+        Cow::Borrowed(image)
+    } else {
+        Cow::Owned(format!("library/{image}"))
+    }
+}
+
 /// Parses a remainder like `grafana/grafana/manifests/latest` into
 /// `(image, kind, reference)` without unnecessary allocations.
 #[inline]
@@ -895,6 +913,34 @@ mod tests {
             reference,
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn test_normalize_docker_library_image_single_segment() {
+        let result = normalize_docker_library_image("nginx");
+        assert_eq!(result, "library/nginx");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_normalize_docker_library_image_multi_segment() {
+        let result = normalize_docker_library_image("grafana/grafana");
+        assert_eq!(result, "grafana/grafana");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_normalize_docker_library_image_deeply_nested() {
+        let result = normalize_docker_library_image("library/redis/alpine");
+        assert_eq!(result, "library/redis/alpine");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_normalize_docker_library_image_already_prefixed() {
+        let result = normalize_docker_library_image("library/nginx");
+        assert_eq!(result, "library/nginx");
+        assert!(matches!(result, Cow::Borrowed(_)));
     }
 
     #[test]

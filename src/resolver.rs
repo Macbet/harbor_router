@@ -484,15 +484,32 @@ impl Resolver {
         // first matching 200 response arrives, cancelling remaining futures.
         // If no content-type matches the client's Accept header, fall back to
         // the first 200 response seen (graceful degradation).
+        // Grace period: after the first 200 with content-type mismatch,
+        // wait up to 200ms for a better match before returning the fallback.
+        const FALLBACK_GRACE: Duration = Duration::from_millis(200);
+
         let count = futures.len();
         let mut results = stream::iter(futures).buffer_unordered(count);
         let mut last_err: Option<anyhow::Error> = None;
         let mut fallback: Option<ResolveResult> = None;
-        while let Some(res) = results.next().await {
-            match res {
+        let mut grace_deadline: Option<tokio::time::Instant> = None;
+
+        loop {
+            let next = if let Some(deadline) = grace_deadline {
+                match tokio::time::timeout_at(deadline, results.next()).await {
+                    Ok(Some(res)) => res,
+                    // Grace period expired or stream exhausted — return fallback
+                    Ok(None) | Err(_) => break,
+                }
+            } else {
+                match results.next().await {
+                    Some(res) => res,
+                    None => break,
+                }
+            };
+
+            match next {
                 Ok(r) if r.status == 200 => {
-                    // Check if this response's Content-Type matches the client's Accept header.
-                    // Empty accept list means no preference — accept any 200.
                     let ct = r
                         .headers
                         .get("content-type")
@@ -510,7 +527,6 @@ impl Resolver {
                         );
                         return Ok(r);
                     }
-                    // No content-type match — save first 200 as fallback.
                     debug!(
                         event = "fanout",
                         project = r.project,
@@ -520,6 +536,7 @@ impl Resolver {
                     );
                     if fallback.is_none() {
                         fallback = Some(r);
+                        grace_deadline = Some(tokio::time::Instant::now() + FALLBACK_GRACE);
                     }
                 }
                 Ok(r) => {
@@ -537,7 +554,6 @@ impl Resolver {
             }
         }
 
-        // Graceful degradation: return fallback 200 even if content-type didn't match.
         if let Some(r) = fallback {
             info!(
                 event = "fanout",
@@ -545,7 +561,7 @@ impl Resolver {
                 reference,
                 project = r.project,
                 result = "fallback",
-                "returning fallback (no content-type match)"
+                "returning fallback after grace period"
             );
             return Ok(r);
         }
@@ -1012,6 +1028,7 @@ fn decode_cache_value(value: &str) -> (&str, Option<u64>) {
 /// Checks if a response Content-Type matches any of the client's Accept values.
 /// Strips parameters (after `;`) and compares media type only.
 /// Supports `*/*` (matches everything) and `application/*` (matches any `application/` type).
+/// Handles comma-separated media types within a single Accept header value (RFC 7231 §5.3.2).
 #[inline]
 fn content_type_matches(response_ct: &str, accept_values: &[String]) -> bool {
     if accept_values.is_empty() {
@@ -1019,23 +1036,29 @@ fn content_type_matches(response_ct: &str, accept_values: &[String]) -> bool {
     }
     // Strip parameters after `;` from response Content-Type
     let ct = response_ct.split(';').next().unwrap_or("").trim();
-    for accept in accept_values {
-        // Strip parameters after `;` from Accept value
-        let av = accept.split(';').next().unwrap_or("").trim();
-        if av == "*/*" {
-            return true;
-        }
-        // Handle type/* wildcards (e.g. application/*)
-        if let Some(prefix) = av.strip_suffix("/*") {
-            if let Some(ct_type) = ct.split('/').next() {
-                if ct_type == prefix {
-                    return true;
+    for accept_header in accept_values {
+        // Accept header may contain comma-separated media types (RFC 7231 §5.3.2)
+        for accept in accept_header.split(',') {
+            // Strip parameters after `;` (quality factor, charset, etc.)
+            let av = accept.split(';').next().unwrap_or("").trim();
+            if av.is_empty() {
+                continue;
+            }
+            if av == "*/*" {
+                return true;
+            }
+            // Handle type/* wildcards (e.g. application/*)
+            if let Some(prefix) = av.strip_suffix("/*") {
+                if let Some(ct_type) = ct.split('/').next() {
+                    if ct_type == prefix {
+                        return true;
+                    }
                 }
             }
-        }
-        // Exact media type match
-        if ct.eq_ignore_ascii_case(av) {
-            return true;
+            // Exact media type match
+            if ct.eq_ignore_ascii_case(av) {
+                return true;
+            }
         }
     }
     false
@@ -2016,6 +2039,56 @@ mod tests {
         assert!(
             content_type_matches(oci_ct, &accept_multi),
             "should match any in list"
+        );
+
+        // Comma-separated Accept header (real Docker client behavior)
+        let accept_csv = vec![format!("{docker_ct}, {oci_ct}")];
+        assert!(
+            content_type_matches(docker_ct, &accept_csv),
+            "comma-separated: should match first type"
+        );
+        assert!(
+            content_type_matches(oci_ct, &accept_csv),
+            "comma-separated: should match second type"
+        );
+        assert!(
+            !content_type_matches("text/plain", &accept_csv),
+            "comma-separated: should not match unrelated type"
+        );
+
+        // Comma-separated with quality parameters
+        let accept_csv_q = vec![format!("{docker_ct};q=0.9, {oci_ct};q=1.0")];
+        assert!(
+            content_type_matches(docker_ct, &accept_csv_q),
+            "comma-separated with quality: should match"
+        );
+        assert!(
+            content_type_matches(oci_ct, &accept_csv_q),
+            "comma-separated with quality: should match"
+        );
+
+        // Real-world Docker manifest pull Accept header
+        let real_docker_accept = vec![
+            "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, */*".to_string()
+        ];
+        assert!(
+            content_type_matches(docker_ct, &real_docker_accept),
+            "real Docker Accept: should match docker manifest v2"
+        );
+        assert!(
+            content_type_matches(oci_ct, &real_docker_accept),
+            "real Docker Accept: should match OCI manifest v1"
+        );
+        assert!(
+            content_type_matches("text/plain", &real_docker_accept),
+            "real Docker Accept: */* should match anything"
+        );
+
+        // Comma-separated with wildcard
+        let accept_csv_wildcard = vec![format!("{docker_ct}, */*")];
+        assert!(
+            content_type_matches("anything/at-all", &accept_csv_wildcard),
+            "comma-separated */* should match anything"
         );
     }
 
