@@ -4,7 +4,7 @@ use arc_swap::ArcSwap;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info};
 
 const DISCOVERY_CACHE_KEY: &str = "discovery:projects";
@@ -187,8 +187,16 @@ impl Discoverer {
     }
 
     async fn refresh(&self) {
+        let start = Instant::now();
         match self.fetch_proxy_cache_projects().await {
             Ok(projects) => {
+                let elapsed = start.elapsed().as_secs_f64();
+                metrics::global().discovery_duration.observe(elapsed);
+                metrics::global().discovery_last_success_timestamp.set(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0.0, |d| d.as_secs_f64()),
+                );
                 let count = projects.len();
                 self.persist_to_cache(&projects).await;
                 self.inner.projects.store(Arc::new(projects));
@@ -201,6 +209,9 @@ impl Discoverer {
                 );
             }
             Err(e) => {
+                let elapsed = start.elapsed().as_secs_f64();
+                metrics::global().discovery_duration.observe(elapsed);
+                metrics::global().discovery_errors_total.inc();
                 error!(
                     event = "discovery",
                     error = %e,

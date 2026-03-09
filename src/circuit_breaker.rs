@@ -64,6 +64,10 @@ impl CircuitBreaker {
                             .circuit_breaker_state
                             .with_label_values(&[project])
                             .set(STATE_HALF_OPEN as f64);
+                        metrics::global()
+                            .circuit_breaker_transitions_total
+                            .with_label_values(&[project, "open", "half_open"])
+                            .inc();
                     }
                     true
                 } else {
@@ -79,7 +83,8 @@ impl CircuitBreaker {
         let health = self.project_health(project);
         health.consecutive_failures.store(0, Ordering::Release);
 
-        let mut current = health.state.load(Ordering::Acquire);
+        let previous = health.state.load(Ordering::Acquire);
+        let mut current = previous;
         while current != STATE_CLOSED {
             match health.state.compare_exchange(
                 current,
@@ -87,7 +92,13 @@ impl CircuitBreaker {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    metrics::global()
+                        .circuit_breaker_transitions_total
+                        .with_label_values(&[project, state_name(current), "closed"])
+                        .inc();
+                    break;
+                }
                 Err(actual) => current = actual,
             }
         }
@@ -114,7 +125,13 @@ impl CircuitBreaker {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        metrics::global()
+                            .circuit_breaker_transitions_total
+                            .with_label_values(&[project, state_name(current), "open"])
+                            .inc();
+                        break;
+                    }
                     Err(actual) => current = actual,
                 }
             }
@@ -131,6 +148,16 @@ impl CircuitBreaker {
         self.projects
             .get(project)
             .expect("project health entry should exist")
+    }
+}
+
+#[inline]
+fn state_name(state: u8) -> &'static str {
+    match state {
+        STATE_CLOSED => "closed",
+        STATE_OPEN => "open",
+        STATE_HALF_OPEN => "half_open",
+        _ => "unknown",
     }
 }
 

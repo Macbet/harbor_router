@@ -1,3 +1,4 @@
+use crate::metrics;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,10 @@ pub trait CacheBackend: Send + Sync {
         self.set(key, value).await;
     }
     async fn delete(&self, key: &str);
+
+    fn entry_count(&self) -> u64 {
+        0
+    }
 }
 
 /// Type-erased cache handle, cheaply cloneable.
@@ -99,6 +104,10 @@ impl CacheBackend for MokaCache {
 
     async fn delete(&self, key: &str) {
         self.inner.invalidate(key);
+    }
+
+    fn entry_count(&self) -> u64 {
+        self.inner.entry_count()
     }
 }
 
@@ -204,9 +213,9 @@ impl RedisCache {
         }
     }
 
-    /// Attempt to reconnect via Sentinel (cold path, mutex-protected).
     async fn try_reconnect(&self) {
         if let Ok(mut sentinel) = self.sentinel.try_lock() {
+            metrics::global().redis_reconnections_total.inc();
             match sentinel.get_async_connection().await {
                 Ok(new_conn) => {
                     self.conn.store(Arc::new(new_conn));
@@ -217,7 +226,6 @@ impl RedisCache {
                 }
             }
         }
-        // If try_lock fails, another task is already reconnecting — skip.
     }
 }
 
@@ -227,8 +235,19 @@ impl CacheBackend for RedisCache {
         let redis_key = self.prefixed(key);
         let mut conn = (*self.conn.load_full()).clone();
         match redis::AsyncCommands::get::<_, Option<String>>(&mut conn, &redis_key).await {
-            Ok(v) => v,
+            Ok(v) => {
+                metrics::global()
+                    .redis_operations_total
+                    .with_label_values(&["get", "ok"])
+                    .inc();
+                v
+            }
             Err(e) => {
+                metrics::global()
+                    .redis_operations_total
+                    .with_label_values(&["get", "error"])
+                    .inc();
+                metrics::global().redis_fallback_total.inc();
                 tracing::debug!(error = %e, key, "redis GET failed, falling back to moka");
                 self.try_reconnect().await;
                 self.fallback.get(key)
@@ -242,8 +261,18 @@ impl CacheBackend for RedisCache {
         let res: Result<(), _> =
             redis::AsyncCommands::set_ex(&mut conn, &redis_key, &value, self.ttl_secs).await;
         if let Err(e) = res {
+            metrics::global()
+                .redis_operations_total
+                .with_label_values(&["set", "error"])
+                .inc();
+            metrics::global().redis_fallback_total.inc();
             tracing::debug!(error = %e, key, "redis SET failed, falling back to moka");
             self.try_reconnect().await;
+        } else {
+            metrics::global()
+                .redis_operations_total
+                .with_label_values(&["set", "ok"])
+                .inc();
         }
         // Always populate local fallback for graceful degradation.
         self.fallback.insert(key, value);
@@ -256,8 +285,18 @@ impl CacheBackend for RedisCache {
         let res: Result<(), _> =
             redis::AsyncCommands::set_ex(&mut conn, &redis_key, &value, ttl_secs).await;
         if let Err(e) = res {
+            metrics::global()
+                .redis_operations_total
+                .with_label_values(&["set", "error"])
+                .inc();
+            metrics::global().redis_fallback_total.inc();
             tracing::debug!(error = %e, key, "redis SET failed, falling back to moka");
             self.try_reconnect().await;
+        } else {
+            metrics::global()
+                .redis_operations_total
+                .with_label_values(&["set", "ok"])
+                .inc();
         }
         // Always populate local fallback for graceful degradation.
         self.fallback.insert(key, value);
@@ -267,10 +306,23 @@ impl CacheBackend for RedisCache {
         let redis_key = self.prefixed(key);
         let mut conn = (*self.conn.load_full()).clone();
         if let Err(e) = redis::AsyncCommands::del::<_, ()>(&mut conn, &redis_key).await {
+            metrics::global()
+                .redis_operations_total
+                .with_label_values(&["del", "error"])
+                .inc();
             tracing::debug!(error = %e, key, "redis DEL failed");
             self.try_reconnect().await;
+        } else {
+            metrics::global()
+                .redis_operations_total
+                .with_label_values(&["del", "ok"])
+                .inc();
         }
         self.fallback.invalidate(key);
+    }
+
+    fn entry_count(&self) -> u64 {
+        self.fallback.entry_count()
     }
 }
 

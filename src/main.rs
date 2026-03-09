@@ -428,6 +428,7 @@ async fn rate_limit_middleware(
     match limiter.check_key(&ip) {
         Ok(_) => next.run(req).await,
         Err(_) => {
+            metrics::global().rate_limit_rejected_total.inc();
             warn!(
                 event = "rate_limit",
                 client_ip = %ip,

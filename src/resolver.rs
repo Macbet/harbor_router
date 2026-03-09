@@ -160,6 +160,7 @@ impl Resolver {
             );
 
             if project == NEGATIVE_CACHE_SENTINEL {
+                metrics::global().negative_cache_hits_total.inc();
                 bail!(
                     "image {}:{} not found in any proxy-cache project",
                     image,
@@ -179,6 +180,7 @@ impl Resolver {
             {
                 Ok(r) if r.status == 200 => {
                     if is_stale {
+                        metrics::global().cache_stale_serves_total.inc();
                         let resolver = self.clone();
                         let image_owned = image.to_string();
                         let reference_owned = reference.to_string();
@@ -345,6 +347,7 @@ impl Resolver {
 
         if !is_leader {
             metrics::global().singleflight_dedup_total.inc();
+            let wait_start = Instant::now();
             debug!(
                 event = "singleflight",
                 image,
@@ -357,6 +360,9 @@ impl Resolver {
             {
                 let current = rx.borrow_and_update();
                 if let Some(ref result) = *current {
+                    metrics::global()
+                        .singleflight_wait_duration
+                        .observe(wait_start.elapsed().as_secs_f64());
                     return result.clone().map_err(|e| anyhow!("{}", e));
                 }
             }
@@ -366,6 +372,9 @@ impl Resolver {
                 .await
                 .map_err(|_| anyhow!("singleflight: follower timed out waiting for leader"))?
                 .map_err(|_| anyhow!("singleflight: leader dropped channel"))?;
+            metrics::global()
+                .singleflight_wait_duration
+                .observe(wait_start.elapsed().as_secs_f64());
             let result = rx.borrow().clone();
             return result
                 .ok_or_else(|| anyhow!("singleflight: leader sent empty result"))?
@@ -373,10 +382,12 @@ impl Resolver {
         }
 
         // We are the leader — do the actual work.
+        metrics::global().singleflight_inflight.inc();
         let res = self
             .parallel_lookup(image, reference, auth, accept)
             .await
             .map(Arc::new);
+        metrics::global().singleflight_inflight.dec();
 
         // Publish result to waiters (watch retains value for late subscribers).
         let watch_val = res.as_ref().map(Arc::clone).map_err(|e| e.to_string());
@@ -479,6 +490,8 @@ impl Resolver {
         if futures.is_empty() {
             bail!("no available proxy-cache projects (all circuits open)");
         }
+
+        metrics::global().fanout_size.observe(futures.len() as f64);
 
         // Use FuturesUnordered via buffer_unordered to return as soon as the
         // first matching 200 response arrives, cancelling remaining futures.
@@ -590,10 +603,20 @@ impl Resolver {
         }
 
         let start = std::time::Instant::now();
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow!("request to {}: {}", project, e))?;
+        let resp = req.send().await.map_err(|e| {
+            let reason = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "other"
+            };
+            metrics::global()
+                .upstream_connection_errors_total
+                .with_label_values(&[reason])
+                .inc();
+            anyhow!("request to {}: {}", project, e)
+        })?;
 
         let status = resp.status().as_u16();
         metrics::global()
@@ -861,6 +884,11 @@ impl Resolver {
     }
 
     pub async fn persist_hot_entries(&self) {
+        metrics::global()
+            .cache_entries
+            .with_label_values(&["local"])
+            .set(self.cache.entry_count() as f64);
+
         if self.cache_warmup_top_n == 0 {
             return;
         }

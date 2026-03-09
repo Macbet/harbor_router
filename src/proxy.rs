@@ -197,10 +197,15 @@ async fn handle_manifest(
 async fn handle_tags(state: &AppState, image: &str, auth: Option<&str>) -> Response {
     let start = Instant::now();
     let result = state.resolver.resolve_tags(image, auth).await;
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let elapsed = start.elapsed().as_secs_f64();
+    let duration_ms = (elapsed * 1000.0) as u64;
 
     match result {
         Err(e) => {
+            metrics::global()
+                .tags_resolve_duration
+                .with_label_values(&["error"])
+                .observe(elapsed);
             error!(
                 event = "tags_resolve",
                 image,
@@ -216,6 +221,10 @@ async fn handle_tags(state: &AppState, image: &str, auth: Option<&str>) -> Respo
             )
         }
         Ok(r) => {
+            metrics::global()
+                .tags_resolve_duration
+                .with_label_values(&["ok"])
+                .observe(elapsed);
             info!(
                 event = "tags_resolve",
                 image,
@@ -393,6 +402,10 @@ async fn probe_blob_project(
                 let s = resp.status().as_u16();
                 // 200 = blob present; 307 = redirect to storage backend (also present).
                 if s == 200 || s == 307 {
+                    metrics::global()
+                        .blob_probe_total
+                        .with_label_values(&["found"])
+                        .inc();
                     return Ok(proj);
                 }
             }
@@ -400,6 +413,10 @@ async fn probe_blob_project(
         }
     }
 
+    metrics::global()
+        .blob_probe_total
+        .with_label_values(&["not_found"])
+        .inc();
     anyhow::bail!("blob {}/{} not found in any project", image, digest);
 }
 
@@ -463,6 +480,19 @@ pub async fn logging_middleware(req: Request, next: Next) -> Response {
         .requests_total
         .with_label_values(&[method.as_str(), req_type, status_class])
         .inc();
+    metrics::global()
+        .request_duration
+        .with_label_values(&[method.as_str(), req_type, status_class])
+        .observe(start.elapsed().as_secs_f64());
+
+    if let Some(cl) = response.headers().get("content-length") {
+        if let Ok(bytes) = cl.to_str().unwrap_or("0").parse::<f64>() {
+            metrics::global()
+                .response_bytes_total
+                .with_label_values(&[req_type])
+                .inc_by(bytes);
+        }
+    }
 
     // Log level based on status and type
     // - 4xx/5xx → WARN (errors should be visible)
