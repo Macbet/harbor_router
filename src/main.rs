@@ -213,7 +213,7 @@ async fn async_main() -> Result<()> {
 
     // ── main router ───────────────────────────────────────────────────────────
     let prefix = format!("/v2/{}/", cfg.proxy_project);
-    let prefix_wildcard = format!("/v2/{}/*path", cfg.proxy_project);
+    let prefix_wildcard = format!("/v2/{}/{{*path}}", cfg.proxy_project);
 
     let disc_for_health = disc.clone();
     let disc_for_ready = disc.clone();
