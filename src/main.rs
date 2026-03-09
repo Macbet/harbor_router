@@ -11,6 +11,7 @@ use axum::{
     extract::ConnectInfo, http::StatusCode, middleware, response::IntoResponse, routing::get,
     Router,
 };
+use base64::Engine;
 use governor::{Quota, RateLimiter};
 use secrecy::ExposeSecret;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -158,6 +159,14 @@ async fn async_main() -> Result<()> {
         cfg.circuit_breaker_threshold,
         cfg.circuit_breaker_timeout.as_secs(),
     ));
+    let service_auth = Arc::new(format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!(
+            "{}:{}",
+            cfg.harbor_username.expose_secret(),
+            cfg.harbor_password.expose_secret()
+        ))
+    ));
     let res = resolver::Resolver::new(
         disc.clone(),
         ttl_cache,
@@ -174,11 +183,14 @@ async fn async_main() -> Result<()> {
         cfg.retry_max_attempts,
         cfg.retry_base_delay,
         cfg.cache_warmup_top_n,
+        cfg.harbor_username.expose_secret(),
+        cfg.harbor_password.expose_secret(),
     )?;
     let app_state = proxy::AppState::new(
         res.clone(),
         cfg.harbor_url.clone(),
         cfg.proxy_project.clone(),
+        service_auth,
         cfg.http2_prior_knowledge,
         cfg.blob_read_timeout,
     )?;

@@ -1,6 +1,6 @@
 [package]
 name = "harbor-router"
-version = "1.4.0"
+version = "1.4.2"
 edition = "2021"
 
 [[bin]]
@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow       = "1.0"
 arc-swap     = "1.8"
+base64       = "0.22"
 async-trait  = "0.1"
 governor     = { version = "0.10", features = ["dashmap"] }  # Rate limiting
 axum         = { version = "0.8", features = ["http1", "http2", "macros"] }
